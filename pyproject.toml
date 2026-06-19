@@ -1,0 +1,25 @@
+[project]
+name = "glyco-grade"
+version = "0.34.3"
+description = "Score GalNAc/Gal O-glycan composition candidates from MS peak lists. Windowed noise floor, isotope envelope, companion + series offsets. Output: tiered table (GREEN/YELLOW/RED/PURGE)."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "openpyxl>=3.1",
+    "click>=8.1",
+    "kaleido>=0.2.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.4"]
+
+[project.scripts]
+glycan-ms = "glycan_ms.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
