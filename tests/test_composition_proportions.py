@@ -7,6 +7,8 @@ from app import (
     _characteristic_peaks_plot,
     _composition_proportion_plot,
     _curated_peak_rows,
+    _graph_cart_zip_bytes,
+    _graph_export_filename,
     _pngs_to_zip_bytes,
     _with_candidate_row_ids,
 )
@@ -34,13 +36,33 @@ def test_composition_proportions_combine_ions_and_use_total_signal() -> None:
     figure = _composition_proportion_plot(_candidate_rows(), "Sample")
     traces = {trace.name: trace for trace in figure.data}
 
-    galnac_1 = traces["1 GalNAc + 4 Gal"]
-    galnac_2 = traces["2 GalNAc + 4 Gal"]
+    galnac_1 = traces["1 GalNAc"]
+    galnac_2 = traces["2 GalNAc"]
     assert list(galnac_1.x) == [5, 6]
     assert list(galnac_1.y) == pytest.approx([30.0, 0.0])
     assert list(galnac_2.y) == pytest.approx([0.0, 70.0])
     assert figure.layout.barmode == "stack"
     assert figure.layout.xaxis.dtick == 1
+
+
+def test_composition_colors_encode_galnac_count_not_exact_composition() -> None:
+    candidates = pd.concat(
+        [
+            _candidate_rows(),
+            pd.DataFrame([
+                {"mz": 1250.0, "intensity": 15.0, "n_galnac": 1, "n_gal": 5, "total": 6, "ion": "Na+", "mz_diff": 0.01},
+            ]),
+        ],
+        ignore_index=True,
+    )
+
+    figure = _composition_proportion_plot(candidates, "Sample")
+    one_galnac_traces = [trace for trace in figure.data if trace.name == "1 GalNAc"]
+
+    assert len(one_galnac_traces) == 2
+    assert len({trace.marker.color for trace in one_galnac_traces}) == 1
+    assert sum(bool(trace.showlegend) for trace in one_galnac_traces) == 1
+    assert figure.layout.legend.title.text == "GalNAc count"
 
 
 def test_removing_a_row_recalculates_proportions() -> None:
@@ -90,3 +112,31 @@ def test_png_zip_supports_one_or_multiple_graphs(files: dict[str, bytes]) -> Non
         )
         for filename, expected in files.items():
             assert archive.read(f"sample_graphs/{filename}") == expected
+
+
+def test_graph_export_filenames_use_requested_suffixes() -> None:
+    assert _graph_export_filename("Dataset 1", "spectrum") == "Dataset_1_spec.png"
+    assert _graph_export_filename("Dataset 1", "peaks") == "Dataset_1_charpeaks.png"
+    assert _graph_export_filename("Dataset 1", "proportions") == "Dataset_1_prograph.png"
+
+
+def test_global_graph_cart_zips_multiple_datasets_together() -> None:
+    cart = {}
+    for dataset_id, dataset_name in (("one", "Dataset 1"), ("two", "Dataset 2")):
+        for kind in ("spectrum", "peaks", "proportions"):
+            cart[f"{dataset_id}::{kind}"] = {
+                "dataset_id": dataset_id,
+                "dataset_name": dataset_name,
+                "kind": kind,
+                "filename": _graph_export_filename(dataset_name, kind),
+                "payload": f"{dataset_id}-{kind}".encode(),
+            }
+
+    payload = _graph_cart_zip_bytes(cart)
+
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        assert sorted(archive.namelist()) == sorted(
+            f"all_prepared_glycan_graphs/{_graph_export_filename(dataset_name, kind)}"
+            for dataset_name in ("Dataset 1", "Dataset 2")
+            for kind in ("spectrum", "peaks", "proportions")
+        )

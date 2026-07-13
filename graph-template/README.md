@@ -26,8 +26,9 @@ composition-proportion graph always sums every valid imported intensity, as
 required for signal proportions.
 
 Dataset titles, subtitles, all four axis labels, peak normalization, visible
-graphs, duplicate display mode, and exact-composition colors are editable in
-the page.
+graphs, duplicate display mode, and GalNAc-count colors are editable in the
+page. Exact composition remains available in the proportion-segment hover;
+segments with the same GalNAc count intentionally share one color.
 
 ## Exports
 

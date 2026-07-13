@@ -157,12 +157,44 @@ def _pngs_to_zip_bytes(folder_name: str, files: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
+_GRAPH_EXPORT_SUFFIXES = {
+    "spectrum": "spec",
+    "peaks": "charpeaks",
+    "proportions": "prograph",
+}
+
+
+def _graph_export_filename(sample_name: str, graph_kind: str) -> str:
+    """Return the requested sample-name + graph-type PNG filename."""
+    return f"{_safe_filename(sample_name)}_{_GRAPH_EXPORT_SUFFIXES[graph_kind]}.png"
+
+
+def _graph_cart_zip_bytes(cart: dict[str, dict[str, Any]]) -> bytes:
+    """Package every prepared dataset graph into one folder in one ZIP.
+
+    Duplicate edited sample names receive a numeric filename suffix so no PNG
+    silently overwrites another dataset's graph in the archive.
+    """
+    files: dict[str, bytes] = {}
+    filename_counts: dict[str, int] = {}
+    for entry in cart.values():
+        filename = _safe_filename(str(entry["filename"]))
+        count = filename_counts.get(filename, 0) + 1
+        filename_counts[filename] = count
+        if count > 1:
+            stem, extension = filename.rsplit(".", 1)
+            filename = f"{stem}_{count}.{extension}"
+        files[filename] = bytes(entry["payload"])
+    return _pngs_to_zip_bytes("all_prepared_glycan_graphs", files)
+
+
 def _download_buttons(
     fig,
     df: pd.DataFrame,
     sample_name: str,
     key_suffix: str,
     *,
+    dataset_id: str,
     characteristic_fig,
     proportion_fig,
     export_signature: str,
@@ -179,23 +211,23 @@ def _download_buttons(
         "spectrum": {
             "label": "Raw analyser spectrum",
             "figure": fig,
-            "filename": f"{safe}_spectrum.png",
+            "filename": _graph_export_filename(sample_name, "spectrum"),
         },
         "peaks": {
             "label": "Characteristic sugar peaks",
             "figure": characteristic_fig,
-            "filename": f"{safe}_characteristic_peaks.png",
+            "filename": _graph_export_filename(sample_name, "peaks"),
         },
         "proportions": {
             "label": "Composition proportions",
             "figure": proportion_fig,
-            "filename": f"{safe}_composition_proportions.png",
+            "filename": _graph_export_filename(sample_name, "proportions"),
         },
     }
     label_to_kind = {
         definition["label"]: kind for kind, definition in graph_definitions.items()
     }
-    prepared_key = f"prepared_graph_downloads::{key_suffix}::{sample_name}"
+    prepared_key = f"prepared_graph_downloads::{dataset_id}"
     prepared = st.session_state.get(prepared_key)
     if not isinstance(prepared, dict) or prepared.get("signature") != export_signature:
         prepared = None
@@ -206,7 +238,7 @@ def _download_buttons(
         "Graphs to prepare or package",
         options=list(label_to_kind),
         default=list(label_to_kind),
-        key=f"selected_graph_downloads::{key_suffix}::{sample_name}",
+        key=f"selected_graph_downloads::{dataset_id}",
         help="Select one graph, several graphs, or all three. A ZIP can contain any selected combination, including one graph.",
     )
     selected_kinds = [label_to_kind[label] for label in selected_labels]
@@ -214,7 +246,7 @@ def _download_buttons(
     with prepare_col:
         prepare_clicked = st.button(
             "Prepare selected PNG downloads",
-            key=f"prepare_graph_downloads::{key_suffix}::{sample_name}::{export_signature}",
+            key=f"prepare_graph_downloads::{dataset_id}::{export_signature}",
             type="primary",
             use_container_width=True,
             disabled=not selected_kinds,
@@ -228,7 +260,7 @@ def _download_buttons(
                 data=xlsx_bytes,
                 file_name=f"{safe}_candidates.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"download_xlsx::{key_suffix}::{sample_name}::{export_signature}",
+                key=f"download_xlsx::{dataset_id}::{export_signature}",
                 use_container_width=True,
             )
     if prepare_clicked:
@@ -238,6 +270,18 @@ def _download_buttons(
                 images[kind] = _fig_to_png_bytes(graph_definitions[kind]["figure"])
         prepared = {"signature": export_signature, "images": images}
         st.session_state[prepared_key] = prepared
+        cart = dict(st.session_state.get("global_prepared_graph_cart", {}))
+        for kind in selected_kinds:
+            payload = images.get(kind, b"")
+            if payload:
+                cart[f"{dataset_id}::{kind}"] = {
+                    "dataset_id": dataset_id,
+                    "dataset_name": sample_name,
+                    "kind": kind,
+                    "filename": graph_definitions[kind]["filename"],
+                    "payload": payload,
+                }
+        st.session_state["global_prepared_graph_cart"] = cart
 
     if prepared is None:
         st.caption(
@@ -245,61 +289,91 @@ def _download_buttons(
             "You can download each prepared graph separately or package the current selection into one ZIP folder. "
             "The camera icon in each publication graph also downloads directly in the browser."
         )
+    else:
+        images = prepared.get("images", {})
+        st.markdown("**Individual prepared files for this dataset**")
+        download_columns = st.columns(3)
+        missing: list[str] = []
+        for column, (kind, definition) in zip(download_columns, graph_definitions.items()):
+            payload = images.get(kind, b"")
+            with column:
+                if payload:
+                    st.download_button(
+                        f"Download {definition['label']} PNG",
+                        data=payload,
+                        file_name=definition["filename"],
+                        mime="image/png",
+                        key=f"download_{kind}_png::{dataset_id}::{export_signature}",
+                        use_container_width=True,
+                    )
+                elif kind in selected_kinds:
+                    missing.append(kind)
+        if missing:
+            st.warning(
+                "Selected but not prepared: "
+                + ", ".join(graph_definitions[kind]["label"] for kind in missing)
+                + ". Click Prepare selected PNG downloads; if rendering fails, use the graph's camera icon."
+            )
+
+    cart = dict(st.session_state.get("global_prepared_graph_cart", {}))
+    st.markdown("**All-dataset ZIP collection**")
+    if not cart:
+        st.caption(
+            "The collection is empty. Preparing graphs adds them here; switching datasets does not clear it."
+        )
         return
-
-    images = prepared.get("images", {})
-    st.markdown("**Individual prepared files**")
-    download_columns = st.columns(3)
-    missing: list[str] = []
-    for column, (kind, definition) in zip(download_columns, graph_definitions.items()):
-        payload = images.get(kind, b"")
-        with column:
-            if payload:
-                st.download_button(
-                    f"Download {definition['label']} PNG",
-                    data=payload,
-                    file_name=definition["filename"],
-                    mime="image/png",
-                    key=f"download_{kind}_png::{key_suffix}::{sample_name}::{export_signature}",
-                    use_container_width=True,
-                )
-            elif kind in selected_kinds:
-                missing.append(kind)
-    if missing:
-        st.warning(
-            "Selected but not prepared: "
-            + ", ".join(graph_definitions[kind]["label"] for kind in missing)
-            + ". Click Prepare selected PNG downloads; if rendering fails, use the graph's camera icon."
-        )
-
-    selected_payloads = {
-        kind: images.get(kind, b"") for kind in selected_kinds
-    }
-    zip_ready = bool(selected_payloads) and all(selected_payloads.values())
-    if zip_ready:
-        folder_name = f"{safe}_graphs"
-        zip_bytes = _pngs_to_zip_bytes(
-            folder_name,
+    dataset_count = len({entry["dataset_id"] for entry in cart.values()})
+    st.caption(
+        f"Collection contains **{len(cart)} graph(s)** from **{dataset_count} dataset(s)**. "
+        "Prepare graphs in another dataset to add them before downloading the combined ZIP."
+    )
+    cart_table = pd.DataFrame(
+        [
             {
-                graph_definitions[kind]["filename"]: payload
-                for kind, payload in selected_payloads.items()
-            },
-        )
-        count = len(selected_payloads)
+                "Dataset": entry["dataset_name"],
+                "Graph type": graph_definitions.get(entry["kind"], {}).get("label", entry["kind"]),
+                "ZIP filename": entry["filename"],
+            }
+            for entry in cart.values()
+        ]
+    )
+    st.dataframe(cart_table, use_container_width=True, hide_index=True)
+    remove_keys = st.multiselect(
+        "Remove specific prepared files from the ZIP collection",
+        options=list(cart),
+        format_func=lambda key: str(cart[key]["filename"]),
+        key=f"remove_from_graph_cart::{dataset_id}",
+    )
+    zip_col, remove_col, clear_col = st.columns([2, 1, 1])
+    with zip_col:
         st.download_button(
-            f"Download selected as ZIP ({count} graph{'s' if count != 1 else ''})",
-            data=zip_bytes,
-            file_name=f"{folder_name}.zip",
+            f"Download all prepared datasets as ZIP ({len(cart)} graphs)",
+            data=_graph_cart_zip_bytes(cart),
+            file_name="all_prepared_glycan_graphs.zip",
             mime="application/zip",
-            key=f"download_graph_zip::{key_suffix}::{sample_name}::{export_signature}::{','.join(selected_kinds)}",
+            key=f"download_global_graph_zip::{dataset_id}::{len(cart)}",
             type="primary",
             use_container_width=True,
-            help="The ZIP contains one folder holding exactly the currently selected graph PNGs. Selecting one graph creates a one-graph ZIP.",
         )
-    elif selected_kinds:
-        st.caption(
-            "Prepare every currently selected graph before downloading that selection as a ZIP."
-        )
+    with remove_col:
+        if st.button(
+            "Remove selected",
+            key=f"remove_selected_graph_cart::{dataset_id}",
+            disabled=not remove_keys,
+            use_container_width=True,
+        ):
+            for key in remove_keys:
+                cart.pop(key, None)
+            st.session_state["global_prepared_graph_cart"] = cart
+            st.rerun()
+    with clear_col:
+        if st.button(
+            "Clear collection",
+            key=f"clear_graph_cart::{dataset_id}",
+            use_container_width=True,
+        ):
+            st.session_state["global_prepared_graph_cart"] = {}
+            st.rerun()
 
 
 def _load_spectrums(
@@ -682,7 +756,13 @@ def _composition_proportion_plot(
         {(int(row.n_galnac), int(row.n_gal)) for row in grouped.itertuples()},
         key=lambda composition: (composition[0], composition[1]),
     )
-    for index, (n_galnac, n_gal) in enumerate(compositions):
+    galnac_counts = sorted({n_galnac for n_galnac, _ in compositions})
+    galnac_colors = {
+        count: _COMPOSITION_COLORS[index % len(_COMPOSITION_COLORS)]
+        for index, count in enumerate(galnac_counts)
+    }
+    shown_galnac_counts: set[int] = set()
+    for n_galnac, n_gal in compositions:
         subset = grouped[
             (grouped["n_galnac"] == n_galnac) & (grouped["n_gal"] == n_gal)
         ]
@@ -695,8 +775,10 @@ def _composition_proportion_plot(
         fig.add_trace(graph_objects.Bar(
             x=dps,
             y=[intensity / grand_total * 100 for intensity in intensities],
-            name=f"{n_galnac} GalNAc + {n_gal} Gal",
-            marker_color=_COMPOSITION_COLORS[index % len(_COMPOSITION_COLORS)],
+            name=f"{n_galnac} GalNAc",
+            legendgroup=f"galnac-{n_galnac}",
+            showlegend=n_galnac not in shown_galnac_counts,
+            marker_color=galnac_colors[n_galnac],
             text=[
                 "" if intensity <= 0 else f"{share:.0f}%" if share >= 10 else f"{share:.1f}%"
                 for intensity, share in zip(intensities, within_dp)
@@ -710,6 +792,7 @@ def _composition_proportion_plot(
                 "summed intensity %{customdata[1]:,.2f}<extra></extra>"
             ),
         ))
+        shown_galnac_counts.add(n_galnac)
     annotations = [
         dict(
             x=dp,
@@ -733,7 +816,7 @@ def _composition_proportion_plot(
         uniformtext=dict(mode="show", minsize=8),
         legend=dict(
             orientation="h", x=0.5, xanchor="center", y=-0.25, yanchor="top",
-            title_text="Exact composition",
+            title_text="GalNAc count",
         ),
         margin=dict(l=70, r=25, t=55, b=125),
         xaxis=dict(
@@ -1532,7 +1615,15 @@ def _render_spectrum(
             f"{plot_key}::{_ions_sig}::{_a_sig}{_b_sig}::"
             f"{_zoom_sig}::{_param_hash}"
         )
-        with st.expander("Raw analyser spectrum", expanded=True):
+        show_raw_graph = st.toggle(
+            "Show raw analyser spectrum",
+            value=st.session_state.get(
+                f"show_raw_graph::{key_suffix}::{label}", True
+            ),
+            key=f"show_raw_graph::{key_suffix}::{label}",
+        )
+        plot_event = None
+        if show_raw_graph:
             plot_event = st.plotly_chart(
                 fig,
                 use_container_width=True,
@@ -1542,7 +1633,7 @@ def _render_spectrum(
                 config={"displayModeBar": False},
             )
 
-        selected_points = plot_event.selection.get("points", [])
+        selected_points = plot_event.selection.get("points", []) if plot_event else []
         if selected_points:
             point = selected_points[-1]
             try:
@@ -1635,7 +1726,14 @@ def _render_spectrum(
     characteristic_fig = _characteristic_peaks_plot(
         display_df, new_name, normalize=normalize_curated
     )
-    with st.expander("Characteristic Sugar Peaks", expanded=True):
+    show_characteristic_graph = st.toggle(
+        "Show characteristic sugar peaks",
+        value=st.session_state.get(
+            f"show_characteristic_graph::{key_suffix}::{label}", True
+        ),
+        key=f"show_characteristic_graph::{key_suffix}::{label}",
+    )
+    if show_characteristic_graph:
         st.plotly_chart(
             characteristic_fig,
             use_container_width=True,
@@ -1647,7 +1745,7 @@ def _render_spectrum(
                 "modeBarButtonsToRemove": ["select2d", "lasso2d"],
                 "toImageButtonOptions": {
                     "format": "png",
-                    "filename": f"{_safe_filename(new_name)}_characteristic_peaks",
+                    "filename": f"{_safe_filename(new_name)}_charpeaks",
                     "width": 1920,
                     "height": 1080,
                     "scale": 1,
@@ -1655,7 +1753,14 @@ def _render_spectrum(
             },
         )
     proportion_fig = _composition_proportion_plot(display_df, new_name)
-    with st.expander("Composition Proportions", expanded=True):
+    show_proportion_graph = st.toggle(
+        "Show composition proportions",
+        value=st.session_state.get(
+            f"show_proportion_graph::{key_suffix}::{label}", True
+        ),
+        key=f"show_proportion_graph::{key_suffix}::{label}",
+    )
+    if show_proportion_graph:
         st.plotly_chart(
             proportion_fig,
             use_container_width=True,
@@ -1667,7 +1772,7 @@ def _render_spectrum(
                 "modeBarButtonsToRemove": ["select2d", "lasso2d"],
                 "toImageButtonOptions": {
                     "format": "png",
-                    "filename": f"{_safe_filename(new_name)}_composition_proportions",
+                    "filename": f"{_safe_filename(new_name)}_prograph",
                     "width": 1920,
                     "height": 1080,
                     "scale": 1,
@@ -1676,7 +1781,16 @@ def _render_spectrum(
         )
 
     # Table.
-    if display_df.empty:
+    show_candidate_table = st.toggle(
+        "Show candidate table",
+        value=st.session_state.get(
+            f"show_candidate_table::{key_suffix}::{label}", True
+        ),
+        key=f"show_candidate_table::{key_suffix}::{label}",
+    )
+    if not show_candidate_table:
+        pass
+    elif display_df.empty:
         st.empty_table_slot = st.empty()
         st.empty_table_slot.info("No compositions matched within the current parameters.")
     else:
@@ -1772,8 +1886,9 @@ def _render_spectrum(
     _download_buttons(
         fig,
         download_df,
-        label,
+        new_name,
         key_suffix,
+        dataset_id=f"{key_suffix}::{label}",
         characteristic_fig=characteristic_fig,
         proportion_fig=proportion_fig,
         export_signature=export_signature,
@@ -1802,9 +1917,17 @@ _PREFIXES = (
     "prepared_graph_downloads::",
     "selected_graph_downloads::",
     "download_graph_zip::",
+    "download_global_graph_zip::",
+    "remove_from_graph_cart::",
+    "remove_selected_graph_cart::",
+    "clear_graph_cart::",
     "proportions::",
     "characteristic::",
     "normalize_curated::",
+    "show_raw_graph::",
+    "show_characteristic_graph::",
+    "show_proportion_graph::",
+    "show_candidate_table::",
     "removed_candidates::",
     "undo_removed::",
     "restore_removed::",

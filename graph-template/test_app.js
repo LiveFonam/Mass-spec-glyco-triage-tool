@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 require("./app.js");
 
-const {parseText, parseMatrix, effectiveRecords, proportionSummary} = globalThis.GlycanGraphTemplate;
+const {parseText, parseMatrix, effectiveRecords, proportionSummary, galnacColorKey} = globalThis.GlycanGraphTemplate;
 
 const vertical = parseText(
   "892.2627563\n16213\n1\n4\n5\nNa+\n1095.312378\n4601\n2\n4\n6\nNa+\n",
@@ -54,5 +54,8 @@ assert.equal(proportions.grandTotal, 20814);
 assert.equal(proportions.dpTotals.get(5), 16213);
 assert.equal(proportions.dpTotals.get(6), 4601);
 assert.equal(proportions.compositionTotals.get("1|4").get(5), 16213);
+assert.equal(galnacColorKey(vertical.records[0]), "1");
+assert.equal(galnacColorKey("1|4"), galnacColorKey("1|5"));
+assert.notEqual(galnacColorKey("1|4"), galnacColorKey("2|4"));
 
 console.log("graph-template parser and duplicate-handling tests passed");

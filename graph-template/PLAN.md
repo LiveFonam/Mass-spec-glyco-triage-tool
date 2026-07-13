@@ -41,12 +41,13 @@ Build a reusable browser-based HTML template that accepts characteristic glycan 
 - Y-axis is the proportion of total summed intensity.
 - For each DP, sum every peak intensity at that total and divide by total intensity across the dataset.
 - Thick stacked bars.
-- Each colored segment represents one exact `(GalNAc, Gal)` composition.
+- Each stacked segment represents one exact `(GalNAc, Gal)` composition, while
+  its color encodes only the GalNAc count.
 - If the same composition appears with multiple ions, combine their intensities.
-- Same composition always uses the same color across datasets.
-- Default color-blind-friendly categorical palette; every composition color is user-editable.
+- Every composition with the same GalNAc count uses the same color across datasets.
+- Default color-blind-friendly categorical palette; every GalNAc-count color is user-editable.
 - Stack/legend order: lowest GalNAc count to highest.
-- Legend appears below the graph.
+- Legend appears below the graph and identifies GalNAc counts.
 - Show every integer DP tick between the global minimum and maximum, including empty totals.
 - Top of each DP bar shows its percentage of total signal with one decimal.
 - Every internal segment shows percentage within that DP; use whole numbers for values >=10%, one decimal below 10%.
@@ -113,13 +114,17 @@ standalone HTML template remains available for portable/offline use.
   compositions and recalculates immediately after row curation.
 - Integrated regression coverage lives in
   `tests/test_composition_proportions.py`.
-- Each of the three analyser graphs is independently collapsible through a
-  Streamlit expander.
-- The Downloads section lets the user select any subset of graphs, prepares
-  only those PNGs on demand, exposes every prepared PNG as an individual
-  download, and can package the current selection into a ZIP. A one-graph ZIP
-  and multi-graph ZIP are both supported; the archive contains a single named
-  folder holding the selected files.
+- Each of the three analyser graphs and the candidate table has an independent,
+  persistent Show/Hide control. Hidden sections stay hidden through preparation
+  and download reruns.
+- The Downloads section lets the user select any subset of graphs and prepares
+  only those PNGs on demand. Prepared files are added to a session-wide export
+  collection that persists while the user switches between and edits datasets.
+- One final ZIP contains every collected graph from every prepared dataset.
+  Individual PNG downloads remain available. Filenames use the edited dataset
+  name plus `_spec.png`, `_charpeaks.png`, or `_prograph.png`.
+- The collection can remove individual prepared files or be cleared entirely;
+  preparing the same dataset/graph type again updates that collection entry.
 
 ## Files completed so far
 

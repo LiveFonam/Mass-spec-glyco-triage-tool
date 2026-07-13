@@ -42,6 +42,9 @@
     return Number(value).toLocaleString(undefined, {maximumFractionDigits: 2});
   }
   function compositionKey(record) { return `${record.nGalNAc}|${record.nGal}`; }
+  function galnacColorKey(recordOrCompositionKey) {
+    return String(typeof recordOrCompositionKey === "string" ? recordOrCompositionKey.split("|")[0] : recordOrCompositionKey.nGalNAc);
+  }
   function compositionLabel(record) { return `${record.nGalNAc} GalNAc + ${record.nGal} Gal`; }
   function sortedCompositionKeys(records) {
     return [...new Set(records.map(compositionKey))].sort((a, b) => {
@@ -259,7 +262,7 @@
   }
 
   function ensurePalette() {
-    const keys = sortedCompositionKeys(state.datasets.flatMap((d) => d.records));
+    const keys = [...new Set(state.datasets.flatMap((d) => d.records).map(galnacColorKey))].sort((a,b)=>Number(a)-Number(b));
     keys.forEach((key, index) => { if (!state.palette[key]) state.palette[key] = COLORS[index % COLORS.length]; });
     return keys;
   }
@@ -270,7 +273,7 @@
       const label = document.createElement("label"); label.className = "color-field";
       const input = document.createElement("input"); input.type = "color"; input.value = state.palette[key];
       input.addEventListener("change", () => { state.palette[key] = input.value; renderAll(); });
-      const text = document.createElement("span"); text.textContent = labelFromKey(key);
+      const text = document.createElement("span"); text.textContent = `${key} GalNAc`;
       label.append(input, text); editor.append(label);
     }
   }
@@ -313,13 +316,15 @@
     const [dpMin, dpMax] = dpRange, dps = Array.from({length:dpMax-dpMin+1},(_,i)=>dpMin+i);
     const summary = proportionSummary(records), grandTotal = summary.grandTotal || 1;
     const {dpTotals, compositionTotals} = summary;
+    const shownGalnacCounts = new Set();
     const traces = sortedCompositionKeys(records).map((key) => {
-      const map = compositionTotals.get(key), color = state.palette[key], x=[],y=[],text=[],custom=[];
+      const galnacKey = galnacColorKey(key), map = compositionTotals.get(key), color = state.palette[galnacKey], x=[],y=[],text=[],custom=[];
       for (const dp of dps) {
         const intensity = map.get(dp)||0, within = dpTotals.get(dp) ? intensity/dpTotals.get(dp)*100 : 0;
         x.push(dp); y.push(intensity/grandTotal*100); text.push(intensity ? internalPercent(within) : ""); custom.push([within,intensity]);
       }
-      return {type:"bar",name:labelFromKey(key),x,y,text,textposition:"inside",insidetextanchor:"middle",textfont:{color:contrastColor(color),size:10},
+      const showlegend = !shownGalnacCounts.has(galnacKey); shownGalnacCounts.add(galnacKey);
+      return {type:"bar",name:`${galnacKey} GalNAc`,legendgroup:`galnac-${galnacKey}`,showlegend,x,y,text,textposition:"inside",insidetextanchor:"middle",textfont:{color:contrastColor(color),size:10},
         marker:{color,line:{color:"#ffffff",width:1}},customdata:custom,
         hovertemplate:"DP %{x}<br>"+escapeHtml(labelFromKey(key))+"<br>%{y:.2f}% of total signal<br>%{customdata[0]:.2f}% within DP<br>summed intensity %{customdata[1]:,.2f}<extra></extra>"};
     });
@@ -328,7 +333,7 @@
     const layout = basePlotLayout(`${dataset.name} — Composition Proportions`, dataset.subtitle);
     Object.assign(layout,{height:510,barmode:"stack",bargap:.12,annotations,showlegend:true,
       uniformtext:{mode:"show",minsize:8},
-      legend:{orientation:"h",x:.5,xanchor:"center",y:-.23,yanchor:"top",title:{text:"Exact composition"}},
+      legend:{orientation:"h",x:.5,xanchor:"center",y:-.23,yanchor:"top",title:{text:"GalNAc count"}},
       margin:{l:78,r:25,t:dataset.subtitle?85:68,b:125}});
     Object.assign(layout.xaxis,{title:{text:escapeHtml(dataset.proportionXLabel)},range:[dpMin-.5,dpMax+.5],tickmode:"linear",dtick:1});
     Object.assign(layout.yaxis,{title:{text:escapeHtml(dataset.proportionYLabel)},ticksuffix:"%",range:[0,maxShare*1.18]});
@@ -438,7 +443,7 @@
     window.addEventListener("resize",()=>state.exportGraphs.forEach((graph)=>Plotly.Plots.resize(graph.div)));
   }
 
-  globalThis.GlycanGraphTemplate = {parseText, parseMatrix, validateRecord, effectiveRecords, proportionSummary};
+  globalThis.GlycanGraphTemplate = {parseText, parseMatrix, validateRecord, effectiveRecords, proportionSummary, galnacColorKey};
   if (typeof document !== "undefined") {
     document.addEventListener("DOMContentLoaded",()=>{bindEvents();renderAll();});
   }
