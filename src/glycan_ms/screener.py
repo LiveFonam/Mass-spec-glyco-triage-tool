@@ -64,6 +64,7 @@ from __future__ import annotations
 import bisect
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
@@ -179,7 +180,7 @@ DEFAULT_COMPANION_TOL_DA: Final[float] = 0.75
 # is that a real biological signal sitting at (e.g.) +1 GalNAc
 # - 0.2 Da is overwhelmingly more likely to be a real
 # companion than a coincidental noise spike, even if the
-# spectrum's 25th-percentile x 2 noise floor at that bin
+# spectrum's lower-percentile noise floor at that bin
 # would normally reject it. The 0.3 Da bound is below the
 # ``companion_tol_da`` (0.75 Da) so it triggers only when the
 # peak is unambiguously at the right offset.
@@ -189,17 +190,15 @@ COMPANION_TIGHT_TOL_DA: Final[float] = 0.3
 # below this we fall back to the global statistic.
 MIN_PEAKS_PER_BIN: Final[int] = 20
 
-# Floor percentile: a peak is "real" only if its intensity is at or above
-# this percentile of peak intensities in its m/z bin. 25th percentile is
-# a conservative-but-not-punishing choice: in a real spectrum with many
-# noise peaks, the 25th percentile sits above the noise but below real
-# signals. The 2.0x multiplier is the safety margin -- a peak must be at
-# least 2x the bin's 25th percentile to count as "above noise".
+# Floor percentile: use the lower fifth of local peak intensities so dense
+# clusters of large low-m/z fragments cannot pull the estimate upward as
+# easily as a mean, median, or upper quartile would. The multiplier is the
+# safety margin applied after the robust percentile is selected.
 # (Originally the multiplier was applied to the *fallback* global
 # statistic too; that proved too aggressive for sparse synthetic test
 # spectra where every peak is signal, so the multiplier now applies
 # only to the per-bin path.)
-NOISE_PERCENTILE: Final[float] = 0.25
+NOISE_PERCENTILE: Final[float] = 0.20
 NOISE_MULTIPLIER: Final[float] = 1.8
 
 # Envelope thresholds. M+0 is the dominant peak; the M+1 satellite is
@@ -354,7 +353,7 @@ def _bin_lo(mz: float) -> float:
     The spectrum uses two bin widths: 300 Da below
     :data:`NOISE_BIN_SPLIT_MZ`, 150 Da at or above it. The split
     keeps the per-bin noise statistic robust (>= 20 peaks per bin
-    for the 25th percentile to be meaningful) at low m/z where
+    for the lower percentile to be meaningful) at low m/z where
     peaks are dense, and gives finer-grained estimates at high m/z
     where glycan peaks are sparse and adjacent compositions sit
     ~150-200 Da apart.
@@ -384,51 +383,141 @@ def _bin_index(mz: float) -> int:
     return int(_bin_lo(mz))
 
 
-def _noise_floor_for_mz(
-    peaks: Sequence[Peak],
-    target_mz: float,
-) -> float:
-    """Robust per-m/z-window noise floor.
+def _noise_region(mz: float) -> str:
+    """Coarse region used when a local bin is too sparse to trust."""
+    if mz < 1000.0:
+        return "low"
+    if mz < NOISE_BIN_SPLIT_MZ:
+        return "mid"
+    return "high"
 
-    Bins ``peaks`` by m/z into the two-tier binning scheme (300 Da
-    below :data:`NOISE_BIN_SPLIT_MZ`, 150 Da above) and returns
-    the :data:`NOISE_PERCENTILE` of intensities in the bin that contains
-    ``target_mz``, multiplied by :data:`NOISE_MULTIPLIER`. Falls back to
-    the global minimum positive intensity (NOT multiplied) if the bin
-    has fewer than :data:`MIN_PEAKS_PER_BIN` peaks. The fallback is
-    intentionally lenient: a sparse bin means we don't trust the local
-    statistic, so we accept any peak with positive intensity rather than
-    rejecting the whole spectrum.
 
-    Returns a positive float. If the input is empty or all intensities
-    are zero, returns a small positive sentinel (1.0) so the caller
-    never gets a zero threshold and rejects every peak.
+def _robust_noise_floor(intensities: Sequence[float]) -> float:
+    """Estimate the lower background component, then take its percentile.
 
-    NOTE: this function has O(N) cost in the size of ``peaks`` because
-    it iterates to build the bin. Callers that need to call it for many
-    target_mz values should use :func:`_build_noise_floor_cache` to
-    precompute the per-bin floors and look them up in O(1).
+    Low-m/z spectra can contain a majority of genuine large peaks. In that
+    case a percentile over *all* peaks still mistakes signal for background.
+    A clear multiplicative gap in the lower half of the sorted intensities is
+    treated as the boundary between the background component and signal.
     """
-    if not peaks:
+    positive = sorted(float(value) for value in intensities if value > 0 and math.isfinite(value))
+    if not positive:
         return 1.0
+    population = positive
+    min_cluster = max(3, int(math.ceil(len(positive) * 0.10)))
+    best_split: int | None = None
+    best_ratio = 1.5
+    # Search only the lower 60%: a gap among the largest signals is not a
+    # noise/signal boundary and should not affect the floor.
+    max_split = min(len(positive) - min_cluster, int(math.floor(len(positive) * 0.60)))
+    for split in range(min_cluster, max_split + 1):
+        lower = positive[split - 1]
+        upper = positive[split]
+        ratio = upper / lower if lower > 0 else float("inf")
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_split = split
+    if best_split is not None:
+        population = positive[:best_split]
+    rank = max(0, int(round(NOISE_PERCENTILE * (len(population) - 1))))
+    return max(population[rank] * NOISE_MULTIPLIER, 1.0)
 
-    bin_lo = _bin_lo(target_mz)
-    bin_hi = bin_lo + _bin_width_for_lo(bin_lo)
-    in_bin = [p.intensity for p in peaks if bin_lo <= p.mz < bin_hi and p.intensity > 0]
 
-    if len(in_bin) >= MIN_PEAKS_PER_BIN:
-        in_bin.sort()
-        idx = max(0, int(round(NOISE_PERCENTILE * (len(in_bin) - 1))))
-        floor = in_bin[idx] * NOISE_MULTIPLIER
-        if floor > 0:
-            return floor
+@dataclass(frozen=True)
+class _NoiseFloorModel:
+    """Cached floors plus provenance for scientific/UI diagnostics."""
 
-    # Fallback: global minimum positive intensity, no multiplier. We
-    # accept any non-zero peak rather than over-penalising sparse data.
-    all_pos = [p.intensity for p in peaks if p.intensity > 0]
+    cache: dict[int, float]
+    fallback: float
+    uncertain_bins: frozenset[int]
+    regional_fallbacks: dict[str, float]
+
+    def floor_at(self, mz: float) -> float:
+        idx = _bin_index(mz)
+        return self.cache.get(idx, self.regional_fallbacks.get(_noise_region(mz), self.fallback))
+
+    def is_uncertain(self, mz: float) -> bool:
+        idx = _bin_index(mz)
+        return idx not in self.cache or idx in self.uncertain_bins
+
+
+def _build_noise_floor_model(peaks: Sequence[Peak]) -> _NoiseFloorModel:
+    """Build regional, smoothed noise floors and uncertainty metadata.
+
+    Populated bins with at least ``MIN_PEAKS_PER_BIN`` use their own
+    lower-percentile statistic. Sparse bins use the corresponding broad
+    low/mid/high-m/z statistic and are explicitly marked uncertain. A
+    three-bin median smooths trusted and fallback estimates across adjacent
+    regions so fixed bin edges do not create abrupt scoring jumps.
+    """
+    bins: dict[int, list[float]] = {}
+    regions: dict[str, list[float]] = {"low": [], "mid": [], "high": []}
+    all_pos: list[float] = []
+    for peak in peaks:
+        intensity = float(peak.intensity)
+        if intensity <= 0 or not math.isfinite(intensity):
+            continue
+        idx = _bin_index(peak.mz)
+        bins.setdefault(idx, []).append(intensity)
+        regions[_noise_region(peak.mz)].append(intensity)
+        all_pos.append(intensity)
+
     if not all_pos:
-        return 1.0
-    return min(all_pos)
+        return _NoiseFloorModel({}, 1.0, frozenset(), {name: 1.0 for name in regions})
+
+    # A robust global fallback is meaningful only with enough observations.
+    # Tiny synthetic/sparse spectra retain the lenient minimum but are marked
+    # uncertain wherever that fallback is used.
+    global_fallback = (
+        _robust_noise_floor(all_pos)
+        if len(all_pos) >= MIN_PEAKS_PER_BIN
+        else min(all_pos)
+    )
+    regional_fallbacks: dict[str, float] = {}
+    for name, values in regions.items():
+        if len(values) >= MIN_PEAKS_PER_BIN:
+            regional_fallbacks[name] = _robust_noise_floor(values)
+        else:
+            regional_fallbacks[name] = global_fallback
+
+    raw: dict[int, float] = {}
+    uncertain: set[int] = set()
+    for idx, intensities in bins.items():
+        if len(intensities) >= MIN_PEAKS_PER_BIN:
+            raw[idx] = _robust_noise_floor(intensities)
+        else:
+            raw[idx] = regional_fallbacks[_noise_region(float(idx))]
+            uncertain.add(idx)
+
+    # Median smoothing uses only physically adjacent bins; it therefore
+    # removes boundary discontinuities without blending distant m/z regions.
+    ordered = sorted(raw)
+    smoothed: dict[int, float] = {}
+    for position, idx in enumerate(ordered):
+        # Give the target bin double weight. This smooths an interior spike
+        # without allowing one adjacent signal-heavy bin to replace the
+        # target's own robust estimate.
+        neighbours = [raw[idx], raw[idx]]
+        for neighbour_pos in (position - 1, position + 1):
+            if not (0 <= neighbour_pos < len(ordered)):
+                continue
+            other = ordered[neighbour_pos]
+            max_spacing = max(_bin_width_for_lo(float(idx)), _bin_width_for_lo(float(other)))
+            if abs(other - idx) <= max_spacing:
+                neighbours.append(raw[other])
+        smoothed[idx] = float(np.median(neighbours))
+
+    return _NoiseFloorModel(
+        smoothed,
+        float(global_fallback),
+        frozenset(uncertain),
+        regional_fallbacks,
+    )
+
+
+def _noise_floor_for_mz(peaks: Sequence[Peak], target_mz: float) -> float:
+    """Return the robust regional noise floor at ``target_mz``."""
+    return _build_noise_floor_model(peaks).floor_at(target_mz)
 
 
 def _build_noise_floor_cache(
@@ -447,40 +536,40 @@ def _build_noise_floor_cache(
     get finer-grained local estimates where glycan peaks are sparser.
 
     ``cache_dict`` maps ``bin_lo -> floor`` where the floor is
-    either the bin's 25th-percentile x :data:`NOISE_MULTIPLIER` (when
-    the bin has at least :data:`MIN_PEAKS_PER_BIN` peaks) or the
-    global fallback intensity (when the bin is too sparse to trust
-    the per-bin statistic).
+    either the bin's background-component lower percentile times
+    :data:`NOISE_MULTIPLIER` (when the bin has enough peaks) or a
+    regional fallback (when the bin is too sparse to trust).
 
-    ``fallback_intensity`` is the global minimum positive intensity
-    across the whole spectrum -- the value the per-call path
-    :func:`_noise_floor_for_mz` returns for a sparse bin. Returning
-    it as part of the cache tuple means a missing-bin lookup in
-    :func:`_noise_floor_cached` is exactly consistent with the
-    per-call path's behaviour, instead of returning ``min(cache.values())``
-    which can disagree when the cache is sparse or empty.
+    ``fallback_intensity`` is the robust global lower-percentile floor
+    when enough observations exist, or the minimum positive intensity
+    for a truly sparse spectrum. It supports legacy raw-cache callers;
+    the richer model uses regional fallbacks directly.
     """
-    bins: dict[int, list[float]] = {}
-    all_pos: list[float] = []
-    for p in peaks:
-        if p.intensity <= 0:
-            continue
-        idx = _bin_index(p.mz)
-        bins.setdefault(idx, []).append(p.intensity)
-        all_pos.append(p.intensity)
+    model = _build_noise_floor_model(peaks)
+    return model.cache, model.fallback
 
-    fallback: float = min(all_pos) if all_pos else 1.0
 
-    out: dict[int, float] = {}
-    for idx, intensities in bins.items():
-        if len(intensities) >= MIN_PEAKS_PER_BIN:
-            intensities.sort()
-            rank = max(0, int(round(NOISE_PERCENTILE * (len(intensities) - 1))))
-            floor = intensities[rank] * NOISE_MULTIPLIER
-            out[idx] = floor if floor > 0 else fallback
-        else:
-            out[idx] = fallback
-    return out, fallback
+def noise_floor_profile(
+    peaks: Sequence[Peak],
+    mz_min: float,
+    mz_max: float,
+    *,
+    points: int = 240,
+) -> tuple[list[float], list[float], list[bool]]:
+    """Sample the scoring noise floor for a Plotly overlay.
+
+    Returns aligned ``(m/z, floor, uncertain)`` lists. Uncertain points use
+    a regional fallback because their local bin contains too few peaks.
+    """
+    if mz_max <= mz_min or points < 2:
+        return [], [], []
+    model = _build_noise_floor_model(peaks)
+    x_values = np.linspace(mz_min, mz_max, points, dtype=float).tolist()
+    return (
+        x_values,
+        [model.floor_at(value) for value in x_values],
+        [model.is_uncertain(value) for value in x_values],
+    )
 
 
 def _noise_floor_cached(
@@ -493,7 +582,7 @@ def _noise_floor_cached(
 
     The cache is the first element of the 2-tuple returned by
     :func:`_build_noise_floor_cache`. ``fallback`` is the second
-    element -- the global minimum positive intensity -- and is
+    element -- the robust global fallback intensity -- and is
     returned for missing bins so the lookup exactly matches what the
     per-call :func:`_noise_floor_for_mz` would compute.
 
@@ -825,7 +914,7 @@ def _score_envelope(
     # it clears the absolute noise floor OR is a meaningful fraction
     # of M+0. Without the relative floor, low-intensity candidates
     # (small M+0) get their naturally-weak M+2 killed by the
-    # absolute noise (typical 25th-percentile x 2.0). The two
+    # absolute noise (the robust lower-percentile floor). The two
     # thresholds are OR'd in the satellite loop below, not AND'd.
     m0_intensity = float(matched_intensity)
     rel_floor_m1 = ENVELOPE_REL_M1_FRAC * m0_intensity
@@ -1058,7 +1147,7 @@ def _score_companion(
     each offset uses its own region's floor.
 
     ``noise_fallback`` is the second element of the 2-tuple returned by
-    :func:`_build_noise_floor_cache` -- the global minimum positive
+    :func:`_build_noise_floor_cache` -- the robust global fallback
     intensity. It is threaded into :func:`_noise_floor_cached` so a
     missing-bin lookup returns the same value the per-call
     :func:`_noise_floor_for_mz` would compute, instead of the old
@@ -1151,7 +1240,7 @@ def _score_companion(
             #       almost certainly a real companion that the
             #       noise floor is over-penalising (e.g. a
             #       +1 GalNAc peak at 0.2 Da off theoretical in a
-            #       bin where the 25th-percentile x 2 floor is
+            #       bin where the robust lower-percentile floor is
             #       high). Count it as a companion and add a
             #       "tight" tag to the note so the user knows
             #       the override fired.
@@ -1245,7 +1334,7 @@ def _score_series(
     on large spectra.
 
     ``noise_fallback`` is the second element of the 2-tuple returned by
-    :func:`_build_noise_floor_cache` -- the global minimum positive
+    :func:`_build_noise_floor_cache` -- the robust global fallback
     intensity. It is threaded into :func:`_noise_floor_cached` so a
     missing-bin lookup returns the same value the per-call
     :func:`_noise_floor_for_mz` would compute, instead of the old
@@ -1487,7 +1576,9 @@ def screen_candidates(
     # so every candidate and every series step gets an O(1) lookup
     # instead of an O(N) bin scan. This is the difference between
     # sub-second and multi-second renders on large spectra.
-    noise_cache, noise_fallback = _build_noise_floor_cache(spectrum_peaks)
+    noise_model = _build_noise_floor_model(spectrum_peaks)
+    noise_cache = noise_model.cache
+    noise_fallback = noise_model.fallback
 
     tiers: list[str] = []
     notes_col: list[str] = []
@@ -1515,7 +1606,8 @@ def screen_candidates(
         # The "noise floor" used for companion / series is the bin
         # around the candidate m/z. The envelope uses the same floor
         # so all three checks are consistent.
-        local_noise = _noise_floor_cached(noise_cache, mz, fallback=noise_fallback)
+        local_noise = noise_model.floor_at(mz)
+        noise_uncertain = noise_model.is_uncertain(mz)
 
         # Companion count. The third return value indicates whether
         # at least one offset was skipped because it would have
@@ -1526,8 +1618,8 @@ def screen_candidates(
         # checked against the noise floor at ITS m/z, not at the
         # candidate's m/z (which can be very different for offsets
         # of 162-365 Da, especially in spectra with non-uniform
-        # background). ``noise_fallback`` is the global min positive
-        # intensity so a missing-bin lookup in the per-offset path
+        # background). ``noise_fallback`` is the robust global fallback
+        # so a missing-bin lookup in the per-offset path
         # returns the same value the per-call ``_noise_floor_for_mz``
         # would compute.
         n_companions, comp_notes, comp_skipped = _score_companion(
@@ -1597,6 +1689,11 @@ def screen_candidates(
         # found would show only the envelope result -- making
         # it look like the companion/series checks weren't run.
         parts: list[str] = []
+        if noise_uncertain:
+            parts.append(
+                f"Noise estimate uncertain at {mz:.1f} m/z "
+                f"(sparse local bin; regional fallback floor {local_noise:.0f})"
+            )
         if not m0_sn_ok:
             parts.append(
                 f"M+0 below {MIN_M0_SNR_FOR_KEEP:g}x noise floor "

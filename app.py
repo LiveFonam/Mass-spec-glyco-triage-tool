@@ -55,6 +55,7 @@ from glycan_ms.core import (
 from glycan_ms.screener import (
     MIN_M0_SNR_FOR_KEEP,
     is_low_sn_purge,
+    noise_floor_profile,
     screen_candidates,
 )
 
@@ -382,15 +383,16 @@ def _spectrum_plot(
     show_ions: Iterable[str] = ("H+", "Na+", "K+"),
     style: str = "sticks",
     mz_min: float = 1000.0,
+    mz_max: float | None = None,
     measure_lines: tuple[float | None, float | None] = (None, None),
     hover_min_intensity: float = 0.0,
 ) -> graph_objects.Figure:
     """Build a Plotly figure of the spectrum with matched candidates overlaid.
 
-    The ``mz_min`` argument drops everything below the given m/z from the
-    chart only. It does NOT touch the candidate dataframe, the analysis,
-    or any tables -- those are produced upstream in ``_render_spectrum``
-    and remain unaffected by the visualization filter.
+    The ``mz_min`` / ``mz_max`` arguments constrain the chart to the
+    selected analysis window. They do NOT touch the candidate dataframe,
+    the analysis, or any tables -- those are produced upstream in
+    ``_render_spectrum`` and remain unaffected by the visualization filter.
 
     ``measure_lines`` is a (A, B) tuple of m/z positions for two
     optional reference lines (drag-to-measure tool). Either may be None
@@ -408,10 +410,12 @@ def _spectrum_plot(
     """
     fig = graph_objects.Figure()
     if peaks:
-        # Chart-only filter: hide peaks below mz_min on the plot. Tables
-        # and analysis still see the full peak list because they consume
-        # the unfiltered list.
-        visible_peaks = [p for p in peaks if p.mz >= mz_min]
+        # Chart-only filter: show only peaks inside the selected m/z
+        # window. Tables and analysis still consume their upstream data.
+        visible_peaks = [
+            p for p in peaks
+            if p.mz >= mz_min and (mz_max is None or p.mz <= mz_max)
+        ]
         if visible_peaks:
             # Split visible peaks into hoverable (intensity >=
             # hover_min_intensity) and non-hoverable. The non-hoverable
@@ -494,8 +498,10 @@ def _spectrum_plot(
             sub = candidates[candidates["ion"] == ion]
             if sub.empty:
                 continue
-            # Chart-only filter for candidate markers too.
+            # Chart-only window for candidate markers too.
             sub = sub[sub["mz"] >= mz_min]
+            if mz_max is not None:
+                sub = sub[sub["mz"] <= mz_max]
             if sub.empty:
                 continue
             fig.add_trace(
@@ -527,6 +533,45 @@ def _spectrum_plot(
                     ),
                 )
             )
+    if peaks and mz_max is not None and mz_max > mz_min:
+        noise_mz, noise_floor, noise_uncertain = noise_floor_profile(
+            peaks, mz_min, mz_max
+        )
+        trusted_floor = [
+            None if uncertain else floor
+            for floor, uncertain in zip(noise_floor, noise_uncertain)
+        ]
+        uncertain_floor = [
+            floor if uncertain else None
+            for floor, uncertain in zip(noise_floor, noise_uncertain)
+        ]
+        if any(value is not None for value in trusted_floor):
+            fig.add_trace(
+                graph_objects.Scatter(
+                    x=noise_mz,
+                    y=trusted_floor,
+                    mode="lines",
+                    name="Noise floor",
+                    line=dict(color="rgba(230, 150, 20, 0.9)", width=2, shape="hv"),
+                    hovertemplate="noise floor %{y:.1f}<br>m/z %{x:.1f}<extra></extra>",
+                    connectgaps=False,
+                )
+            )
+        if any(value is not None for value in uncertain_floor):
+            fig.add_trace(
+                graph_objects.Scatter(
+                    x=noise_mz,
+                    y=uncertain_floor,
+                    mode="lines",
+                    name="Noise floor (uncertain)",
+                    line=dict(color="rgba(210, 80, 40, 0.9)", width=2, dash="dot", shape="hv"),
+                    hovertemplate=(
+                        "regional fallback %{y:.1f}<br>"
+                        "m/z %{x:.1f}<br>local estimate uncertain<extra></extra>"
+                    ),
+                    connectgaps=False,
+                )
+            )
     fig.update_layout(
         title=label,
         xaxis_title="m/z",
@@ -543,6 +588,11 @@ def _spectrum_plot(
         hovermode="closest",
         showlegend=True,
     )
+    # Plotly's autorange adds proportional padding, which leaves a large
+    # empty band before the first peak on wide windows such as 600-5000.
+    # Pin the axis to the user's selected analysis limits instead.
+    if mz_max is not None and mz_max > mz_min:
+        fig.update_xaxes(range=[mz_min, mz_max])
     # Hide the Plotly modebar (zoom, pan, autoscale, etc.).
     fig.update_layout(modebar=dict(remove=["zoom", "pan", "select", "lasso", "resetScale", "autoScale"]))
 
@@ -1000,6 +1050,13 @@ def _render_spectrum(
             new_name,
             show_ions=show_ions,
             style=style,
+            # Keep the chart's lower m/z bound aligned with the sidebar
+            # window used by the solver/table. Previously this argument
+            # was omitted, so _spectrum_plot silently used its 1000.0
+            # default even after the user expanded the analysis below
+            # 1000 m/z.
+            mz_min=float(st.session_state.get("sidebar_mz_lo", 1000.0)),
+            mz_max=float(st.session_state.get("sidebar_mz_hi", 10000.0)),
             measure_lines=(_measure_state.get("A"), _measure_state.get("B")),
             # Threshold for hover tooltips on the spectrum trace:
             # peaks at or above the sidebar's minimum intensity show

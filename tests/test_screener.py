@@ -40,6 +40,7 @@ from glycan_ms.screener import (  # noqa: E402
     SERIES_GAP_LO,
     SERIES_MIN_LENGTH,
     _build_noise_floor_cache,
+    _build_noise_floor_model,
     _composition_formula,
     _envelope_for,
     _has_peak_near,
@@ -53,6 +54,7 @@ from glycan_ms.screener import (  # noqa: E402
     _tier_from_scores,
     envelope_note_is_ok,
     is_low_sn_purge,
+    noise_floor_profile,
     screen_candidates,
 )
 
@@ -93,13 +95,13 @@ def test_noise_floor_empty_input_returns_sentinel() -> None:
 
 
 def test_noise_floor_uses_bin_percentile_when_full() -> None:
-    # 30 peaks densely packed in the 900-1200 bin; the 25th-percentile
-    # of those 30 intensities x 2.0 should be the floor.
+    # 30 peaks densely packed in the 900-1200 bin; the 20th-percentile
+    # of those 30 intensities times the multiplier should be the floor.
     peaks = [Peak(mz=900.0 + i, intensity=float(i + 1)) for i in range(30)]
     # Bin edges for mz=1000, bin_width=300: bin_lo = 900, bin_hi = 1200.
-    # 25th-percentile index = round(0.25 * 29) = 7 -> intensity 8.0.
-    # Floor = 8.0 * NOISE_MULTIPLIER.
-    expected = 8.0 * NOISE_MULTIPLIER
+    # 20th-percentile index = round(0.20 * 29) = 6 -> intensity 7.0.
+    # Floor = 7.0 * NOISE_MULTIPLIER.
+    expected = 7.0 * NOISE_MULTIPLIER
     assert _noise_floor_for_mz(peaks, 1000.0) == pytest.approx(expected)
 
 
@@ -206,11 +208,9 @@ def test_noise_floor_cache_returns_fallback_on_miss() -> None:
     )
 
 
-def test_noise_floor_cache_fallback_disagrees_with_old_min_cache_values() -> None:
-    """Lock in the Bug #6 fix: the missing-bin return value is
-    ``global_min_positive_intensity`` (no multiplier), NOT
-    ``min(cache.values())`` (which is a per-bin statistic and can
-    differ from the global minimum).
+def test_noise_floor_cache_uses_robust_global_fallback_on_miss() -> None:
+    """A missing bin uses the robust global lower percentile, not one
+    isolated minimum or the minimum of unrelated cached bin floors.
 
     Set up a spectrum where the per-bin floors are HIGHER than the
     global minimum, so the old `min(cache.values())` heuristic and
@@ -229,9 +229,10 @@ def test_noise_floor_cache_fallback_disagrees_with_old_min_cache_values() -> Non
     peaks = [Peak(mz=900.0 + i, intensity=float(i + 10)) for i in range(30)]
     peaks.append(Peak(mz=5000.0, intensity=2.0))
     cache, fallback = _build_noise_floor_cache(peaks)
-    # The global fallback is the min positive intensity: 2.0.
-    assert fallback == pytest.approx(2.0)
-    # The populated bin's floor at lo=900 is the 25th-percentile x
+    # Sorted globally: 2, 10..39. The 20th-percentile rank is 6,
+    # intensity 15; applying the 1.8 multiplier gives 27.
+    assert fallback == pytest.approx(27.0)
+    # The populated bin's floor at lo=900 is the 20th-percentile x
     # NOISE_MULTIPLIER; for these intensities (10..39) that's around
     # (17) * 1.8 = 30.6. Whatever the exact value, it's >> 2.0.
     populated_bin_floor = cache[900]
@@ -239,13 +240,50 @@ def test_noise_floor_cache_fallback_disagrees_with_old_min_cache_values() -> Non
         f"populated bin floor must be > global min for this test to be "
         f"meaningful; got {populated_bin_floor}"
     )
-    # Querying an empty bin at m/z 6000 must return the global min
-    # (2.0), NOT min(cache.values()) which would be populated_bin_floor.
+    # Querying an empty bin at m/z 6000 must return the robust global
+    # fallback, not min(cache.values()).
     looked_up = _noise_floor_cached(cache, 6000.0, fallback=fallback)
-    assert looked_up == pytest.approx(2.0), (
-        f"cache miss must return the global min (2.0); got {looked_up}. "
+    assert looked_up == pytest.approx(27.0), (
+        f"cache miss must return the robust fallback (27.0); got {looked_up}. "
         f"Old behaviour would have returned {populated_bin_floor} (min of cache.values())."
     )
+
+
+def test_noise_floor_separates_large_signal_cluster_from_background() -> None:
+    """Many large low-m/z peaks must not redefine signal as noise."""
+    background = [
+        Peak(mz=610.0 + i, intensity=100.0 + i * 10.0)
+        for i in range(5)
+    ]
+    signals = [
+        Peak(mz=650.0 + i, intensity=10_000.0)
+        for i in range(30)
+    ]
+
+    floor = _noise_floor_for_mz(background + signals, 700.0)
+
+    assert floor < 500.0
+
+
+def test_sparse_low_mz_bin_uses_regional_floor_and_is_uncertain() -> None:
+    regional_background = [
+        Peak(mz=610.0 + i, intensity=100.0)
+        for i in range(30)
+    ]
+    sparse_target = Peak(mz=950.0, intensity=10_000.0)
+    model = _build_noise_floor_model([*regional_background, sparse_target])
+
+    assert model.floor_at(950.0) == pytest.approx(180.0)
+    assert model.is_uncertain(950.0) is True
+
+
+def test_noise_profile_exposes_uncertain_regions_for_graph() -> None:
+    peaks = [Peak(mz=650.0 + i, intensity=100.0) for i in range(30)]
+    mz, floors, uncertain = noise_floor_profile(peaks, 600.0, 1200.0, points=25)
+
+    assert len(mz) == len(floors) == len(uncertain) == 25
+    assert any(uncertain)
+    assert all(floor > 0 for floor in floors)
 
 
 # ---------------------------------------------------------------------------
