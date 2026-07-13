@@ -41,11 +41,19 @@ Build a reusable browser-based HTML template that accepts characteristic glycan 
 - Y-axis is the proportion of total summed intensity.
 - For each DP, sum every peak intensity at that total and divide by total intensity across the dataset.
 - Thick stacked bars.
+- Percentage labels always stay horizontal and never rotate vertically.
+- Smaller within-bar proportions use smaller percentage-label text so labels fit narrow segments.
 - Each stacked segment represents one exact `(GalNAc, Gal)` composition, while
   its color encodes only the GalNAc count.
 - If the same composition appears with multiple ions, combine their intensities.
 - Every composition with the same GalNAc count uses the same color across datasets.
-- Default color-blind-friendly categorical palette; every GalNAc-count color is user-editable.
+- Optional distinct-color mode starts from a color-blind-friendly categorical
+  palette; every GalNAc-count color is user-editable.
+- Default color mode is a single-color concentration gradient using green
+  `#009E73`: lower GalNAc counts are lighter and higher counts use increasingly
+  stronger shades. The base color is user-editable.
+- An optional distinct-color mode assigns an independently editable color to
+  every GalNAc count.
 - Stack/legend order: lowest GalNAc count to highest.
 - Legend appears below the graph and identifies GalNAc counts.
 - Show every integer DP tick between the global minimum and maximum, including empty totals.

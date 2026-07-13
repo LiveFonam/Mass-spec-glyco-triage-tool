@@ -596,6 +596,42 @@ _COMPOSITION_COLORS = (
     "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9",
     "#F0E442", "#332288", "#44AA99", "#117733", "#999933", "#CC6677",
 )
+_DEFAULT_GALNAC_GREEN = "#009E73"
+
+
+def _galnac_color_map(
+    counts: Iterable[int],
+    *,
+    mode: str = "gradient",
+    base_color: str = _DEFAULT_GALNAC_GREEN,
+    distinct_colors: dict[int, str] | None = None,
+) -> dict[int, str]:
+    """Map GalNAc counts to either green-style concentration or distinct colors."""
+    ordered = sorted({int(count) for count in counts})
+    if not ordered:
+        return {}
+    if mode == "distinct":
+        overrides = distinct_colors or {}
+        return {
+            count: overrides.get(
+                count, _COMPOSITION_COLORS[index % len(_COMPOSITION_COLORS)]
+            )
+            for index, count in enumerate(ordered)
+        }
+    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", base_color):
+        base_color = _DEFAULT_GALNAC_GREEN
+    red, green, blue = (
+        int(base_color[index:index + 2], 16) for index in (1, 3, 5)
+    )
+    colors: dict[int, str] = {}
+    for index, count in enumerate(ordered):
+        concentration = 1.0 if len(ordered) == 1 else 0.35 + 0.65 * index / (len(ordered) - 1)
+        mixed = tuple(
+            round(255 * (1.0 - concentration) + channel * concentration)
+            for channel in (red, green, blue)
+        )
+        colors[count] = "#{:02X}{:02X}{:02X}".format(*mixed)
+    return colors
 
 
 def _curated_peak_rows(candidates: pd.DataFrame) -> pd.DataFrame:
@@ -714,6 +750,10 @@ def _characteristic_peaks_plot(
 def _composition_proportion_plot(
     candidates: pd.DataFrame,
     label: str,
+    *,
+    color_mode: str = "gradient",
+    base_color: str = _DEFAULT_GALNAC_GREEN,
+    distinct_colors: dict[int, str] | None = None,
 ) -> graph_objects.Figure:
     """Build stacked signal proportions by DP from the retained candidates."""
     fig = graph_objects.Figure()
@@ -757,10 +797,12 @@ def _composition_proportion_plot(
         key=lambda composition: (composition[0], composition[1]),
     )
     galnac_counts = sorted({n_galnac for n_galnac, _ in compositions})
-    galnac_colors = {
-        count: _COMPOSITION_COLORS[index % len(_COMPOSITION_COLORS)]
-        for index, count in enumerate(galnac_counts)
-    }
+    galnac_colors = _galnac_color_map(
+        galnac_counts,
+        mode=color_mode,
+        base_color=base_color,
+        distinct_colors=distinct_colors,
+    )
     shown_galnac_counts: set[int] = set()
     for n_galnac, n_gal in compositions:
         subset = grouped[
@@ -771,6 +813,10 @@ def _composition_proportion_plot(
         within_dp = [
             intensity / float(dp_totals[dp]) * 100 if dp_totals.get(dp) else 0.0
             for dp, intensity in zip(dps, intensities)
+        ]
+        label_sizes = [
+            6 if share < 5 else 8 if share < 12 else 10 if share < 25 else 12
+            for share in within_dp
         ]
         fig.add_trace(graph_objects.Bar(
             x=dps,
@@ -784,6 +830,8 @@ def _composition_proportion_plot(
                 for intensity, share in zip(intensities, within_dp)
             ],
             textposition="inside",
+            textangle=0,
+            textfont=dict(size=label_sizes),
             customdata=list(zip(within_dp, intensities)),
             hovertemplate=(
                 "DP %{x}<br>" + f"{n_galnac} GalNAc + {n_gal} Gal<br>"
@@ -813,7 +861,7 @@ def _composition_proportion_plot(
         dragmode="zoom",
         hovermode="closest",
         annotations=annotations,
-        uniformtext=dict(mode="show", minsize=8),
+        uniformtext=dict(mode="show", minsize=6),
         legend=dict(
             orientation="h", x=0.5, xanchor="center", y=-0.25, yanchor="top",
             title_text="GalNAc count",
@@ -1723,6 +1771,48 @@ def _render_spectrum(
         ),
         key=f"normalize_curated::{key_suffix}::{label}",
     )
+    color_mode_key = f"proportion_color_mode::{key_suffix}::{label}"
+    st.session_state.setdefault(color_mode_key, "gradient")
+    color_col, base_color_col = st.columns(2)
+    with color_col:
+        proportion_color_mode = st.selectbox(
+            "Proportion color style",
+            options=["gradient", "distinct"],
+            format_func=lambda mode: (
+                "Single-color concentration (default)"
+                if mode == "gradient"
+                else "Distinct colors by GalNAc count"
+            ),
+            key=color_mode_key,
+        )
+    base_color_key = f"proportion_base_color::{key_suffix}::{label}"
+    st.session_state.setdefault(base_color_key, _DEFAULT_GALNAC_GREEN)
+    with base_color_col:
+        proportion_base_color = st.color_picker(
+            "Base concentration color",
+            key=base_color_key,
+            disabled=proportion_color_mode != "gradient",
+            help="Higher GalNAc counts use increasingly stronger shades of this color.",
+        )
+    galnac_counts = sorted(
+        {
+            int(value)
+            for value in display_df.get("n_galnac", pd.Series(dtype="int64")).dropna()
+        }
+    )
+    distinct_galnac_colors: dict[int, str] = {}
+    if proportion_color_mode == "distinct" and galnac_counts:
+        with st.popover("Edit distinct GalNAc colors"):
+            for index, count in enumerate(galnac_counts):
+                picker_key = f"galnac_color::{key_suffix}::{label}::{count}"
+                st.session_state.setdefault(
+                    picker_key,
+                    _COMPOSITION_COLORS[index % len(_COMPOSITION_COLORS)],
+                )
+                distinct_galnac_colors[count] = st.color_picker(
+                    f"{count} GalNAc",
+                    key=picker_key,
+                )
     characteristic_fig = _characteristic_peaks_plot(
         display_df, new_name, normalize=normalize_curated
     )
@@ -1752,7 +1842,13 @@ def _render_spectrum(
                 },
             },
         )
-    proportion_fig = _composition_proportion_plot(display_df, new_name)
+    proportion_fig = _composition_proportion_plot(
+        display_df,
+        new_name,
+        color_mode=proportion_color_mode,
+        base_color=proportion_base_color,
+        distinct_colors=distinct_galnac_colors,
+    )
     show_proportion_graph = st.toggle(
         "Show composition proportions",
         value=st.session_state.get(
@@ -1878,6 +1974,12 @@ def _render_spectrum(
                 style,
                 str(auto_zoom_detail),
                 str(normalize_curated),
+                proportion_color_mode,
+                proportion_base_color,
+                ",".join(
+                    f"{count}:{color}"
+                    for count, color in sorted(distinct_galnac_colors.items())
+                ),
                 str(export_measure.get("A")),
                 str(export_measure.get("B")),
             ]
@@ -1924,6 +2026,9 @@ _PREFIXES = (
     "proportions::",
     "characteristic::",
     "normalize_curated::",
+    "proportion_color_mode::",
+    "proportion_base_color::",
+    "galnac_color::",
     "show_raw_graph::",
     "show_characteristic_graph::",
     "show_proportion_graph::",

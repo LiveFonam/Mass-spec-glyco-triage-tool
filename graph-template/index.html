@@ -64,6 +64,10 @@
         <div><p class="step">3</p><div><h2 id="palette-heading">GalNAc-count colors</h2><p>Every GalNAc amount has one consistent, editable color across datasets.</p></div></div>
         <button id="reset-colors" class="button ghost" type="button">Reset colors</button>
       </div>
+      <div class="palette-options">
+        <label>Color style<select id="color-mode"><option value="gradient" selected>Single-color concentration (default)</option><option value="distinct">Distinct colors by GalNAc count</option></select></label>
+        <label>Base concentration color<input id="base-color" type="color" value="#009E73"></label>
+      </div>
       <div id="palette-editor" class="palette-editor"></div>
     </section>
 

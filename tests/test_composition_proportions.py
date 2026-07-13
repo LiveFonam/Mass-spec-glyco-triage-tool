@@ -9,6 +9,7 @@ from app import (
     _curated_peak_rows,
     _graph_cart_zip_bytes,
     _graph_export_filename,
+    _galnac_color_map,
     _pngs_to_zip_bytes,
     _with_candidate_row_ids,
 )
@@ -63,6 +64,41 @@ def test_composition_colors_encode_galnac_count_not_exact_composition() -> None:
     assert len({trace.marker.color for trace in one_galnac_traces}) == 1
     assert sum(bool(trace.showlegend) for trace in one_galnac_traces) == 1
     assert figure.layout.legend.title.text == "GalNAc count"
+
+
+def test_proportion_labels_stay_horizontal_and_shrink_for_small_segments() -> None:
+    candidates = pd.DataFrame([
+        {"mz": 900.0, "intensity": 95.0, "n_galnac": 1, "n_gal": 4, "total": 5, "ion": "H+"},
+        {"mz": 922.0, "intensity": 5.0, "n_galnac": 2, "n_gal": 3, "total": 5, "ion": "Na+"},
+    ])
+
+    figure = _composition_proportion_plot(candidates, "Sample")
+
+    assert all(trace.textangle == 0 for trace in figure.data)
+    sizes = {trace.name: trace.textfont.size[0] for trace in figure.data}
+    assert sizes["2 GalNAc"] < sizes["1 GalNAc"]
+    assert figure.layout.uniformtext.minsize == 6
+
+
+def test_default_galnac_colors_use_increasing_green_concentration() -> None:
+    colors = _galnac_color_map([1, 2, 3])
+
+    assert colors[3] == "#009E73"
+    brightness = {
+        count: sum(int(color[index:index + 2], 16) for index in (1, 3, 5))
+        for count, color in colors.items()
+    }
+    assert brightness[1] > brightness[2] > brightness[3]
+
+
+def test_distinct_galnac_colors_are_user_overridable() -> None:
+    colors = _galnac_color_map(
+        [1, 2],
+        mode="distinct",
+        distinct_colors={1: "#112233", 2: "#445566"},
+    )
+
+    assert colors == {1: "#112233", 2: "#445566"}
 
 
 def test_removing_a_row_recalculates_proportions() -> None:

@@ -30,6 +30,11 @@ graphs, duplicate display mode, and GalNAc-count colors are editable in the
 page. Exact composition remains available in the proportion-segment hover;
 segments with the same GalNAc count intentionally share one color.
 
+The default proportion style is a single green concentration scale: lower
+GalNAc counts are lighter and higher counts become increasingly strong green.
+The base color is editable. Switch to **Distinct colors by GalNAc count** to
+choose a separate editable color for every GalNAc amount.
+
 ## Exports
 
 Each graph can be exported separately as a white-background PNG. Select multiple graphs to download them separately or package them into one ZIP. PNG dimensions default to 1920 × 1080 and are editable.
