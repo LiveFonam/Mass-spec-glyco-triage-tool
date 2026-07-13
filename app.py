@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import re
 import sys
 import tempfile
@@ -56,6 +57,7 @@ from glycan_ms.screener import (
     MIN_M0_SNR_FOR_KEEP,
     is_low_sn_purge,
     noise_floor_profile,
+    noise_floor_values,
     screen_candidates,
 )
 
@@ -384,6 +386,7 @@ def _spectrum_plot(
     style: str = "sticks",
     mz_min: float = 1000.0,
     mz_max: float | None = None,
+    auto_zoom_detail: bool = False,
     measure_lines: tuple[float | None, float | None] = (None, None),
     hover_min_intensity: float = 0.0,
 ) -> graph_objects.Figure:
@@ -399,113 +402,117 @@ def _spectrum_plot(
     to skip drawing that line. When both are set, a small annotation
     shows the |B - A| delta in the top-right of the plot.
 
-    ``hover_min_intensity`` is the intensity threshold for the
-    spectrum's hover tooltip. Peaks at or above this threshold show
-    their m/z + intensity on hover; peaks below the threshold are
-    drawn (so the user can see them) but do not show a tooltip. The
-    default of 0.0 keeps the legacy behaviour (no hover at all) for
-    callers that don't pass it; the file-upload path passes the
-    sidebar's ``min_intensity`` so the user can browse high peaks
-    with the mouse.
+    ``auto_zoom_detail`` focuses the visual range on 1000-5050 m/z and
+    clips the tallest 5% from the y-axis scale so smaller peaks remain
+    legible. It changes visualization only, never scoring.
+
+    Every spectrum point remains hoverable/selectable regardless of
+    ``hover_min_intensity``. The threshold is reported as metadata
+    instead of hiding information for low-intensity peaks.
     """
     fig = graph_objects.Figure()
+    view_mz_min = max(mz_min, 1000.0) if auto_zoom_detail else mz_min
+    view_mz_max = (
+        min(mz_max, 5050.0)
+        if auto_zoom_detail and mz_max is not None
+        else mz_max
+    )
+    visible_peaks: list[Peak] = []
     if peaks:
         # Chart-only filter: show only peaks inside the selected m/z
         # window. Tables and analysis still consume their upstream data.
-        visible_peaks = [
-            p for p in peaks
-            if p.mz >= mz_min and (mz_max is None or p.mz <= mz_max)
-        ]
+        visible_peaks = dedup_peaks(
+            [
+                p for p in peaks
+                if p.mz >= view_mz_min
+                and (view_mz_max is None or p.mz <= view_mz_max)
+            ],
+            bin_width=0.01,
+        )
         if visible_peaks:
-            # Split visible peaks into hoverable (intensity >=
-            # hover_min_intensity) and non-hoverable. The non-hoverable
-            # trace is drawn so the user can still see the peak
-            # visually, but it has hoverinfo="skip" so the mouse
-            # tooltip doesn't get cluttered with low-signal noise
-            # spikes. The hoverable trace shows the m/z and intensity
-            # on hover so the user can browse the spectrum without
-            # having to click each candidate row.
-            if hover_min_intensity > 0.0:
-                hoverable = [p for p in visible_peaks if p.intensity >= hover_min_intensity]
-                non_hoverable = [p for p in visible_peaks if p.intensity < hover_min_intensity]
-            else:
-                # Default behaviour: no hover at all (legacy).
-                hoverable = []
-                non_hoverable = visible_peaks
-            if non_hoverable:
-                nh_mz = [p.mz for p in non_hoverable]
-                nh_int = [p.intensity for p in non_hoverable]
-                fig.add_trace(
-                    graph_objects.Scatter(
-                        x=nh_mz,
-                        y=nh_int,
-                        mode="markers" if style == "dots" else "lines",
-                        name="Spectrum",
-                        legendgroup="spectrum",
-                        showlegend=False,
-                        line=dict(color="rgba(80, 80, 80, 0.5)", width=1),
-                        marker=dict(
-                            color="rgba(80, 80, 80, 0.5)",
-                            size=1,
-                            symbol="circle",
-                        ),
-                        # Below-threshold peaks: drawn but no hover
-                        # tooltip. Keeps the tooltip clean when the
-                        # user brushes across many low-signal noise
-                        # spikes.
-                        hoverinfo="skip",
-                        hovertemplate=" ",
-                    )
+            peak_mz = [p.mz for p in visible_peaks]
+            peak_intensity = [p.intensity for p in visible_peaks]
+            peak_floor, peak_uncertain = noise_floor_values(peaks, peak_mz)
+            peak_customdata = [
+                [
+                    floor,
+                    intensity / floor if floor > 0 else float("inf"),
+                    "uncertain" if uncertain else "trusted",
+                    (
+                        "below display threshold"
+                        if intensity < hover_min_intensity
+                        else "above display threshold"
+                    ),
+                ]
+                for intensity, floor, uncertain in zip(
+                    peak_intensity, peak_floor, peak_uncertain
                 )
-            if hoverable:
-                h_mz = [p.mz for p in hoverable]
-                h_int = [p.intensity for p in hoverable]
-                fig.add_trace(
-                    graph_objects.Scatter(
-                        x=h_mz,
-                        y=h_int,
-                        mode="markers" if style == "dots" else "lines",
-                        name="Spectrum",
-                        legendgroup="spectrum",
-                        showlegend=False,
-                        line=dict(color="rgba(80, 80, 80, 0.5)", width=1),
-                        marker=dict(
-                            color="rgba(80, 80, 80, 0.5)",
-                            size=1,
-                            symbol="circle",
-                        ),
-                        # Above-threshold peaks: hoverable. The
-                        # tooltip shows m/z + intensity so the user
-                        # can browse the spectrum and see the exact
-                        # m/z of each visible peak. The <extra></extra>
-                        # suppresses Plotly's default trace-name
-                        # annotation so the tooltip is just the
-                        # m/z + intensity line.
-                        hoverinfo="x+y",
-                        hovertemplate=(
-                            "m/z %{x:.4f}<br>"
-                            "intensity %{y:.1f}<extra></extra>"
-                        ),
-                    )
+            ]
+            fig.add_trace(
+                # WebGL keeps tens of thousands of selectable peaks responsive.
+                # SVG Scatter became noticeably slow once every raw peak gained
+                # hover and selection metadata.
+                graph_objects.Scattergl(
+                    x=peak_mz,
+                    y=peak_intensity,
+                    mode="markers" if style == "dots" else "lines+markers",
+                    name="Spectrum",
+                    legendgroup="spectrum",
+                    showlegend=False,
+                    line=dict(color="rgba(80, 80, 80, 0.5)", width=1),
+                    marker=dict(
+                        color="rgba(80, 80, 80, 0.65)",
+                        size=4 if style == "dots" else 3,
+                        symbol="circle",
+                    ),
+                    customdata=peak_customdata,
+                    hoverinfo="x+y",
+                    hovertemplate=(
+                        "m/z %{x:.4f}<br>"
+                        "intensity %{y:.1f}<br>"
+                        "noise floor %{customdata[0]:.1f}<br>"
+                        "S/N %{customdata[1]:.2f}<br>"
+                        "noise estimate %{customdata[2]}<br>"
+                        "%{customdata[3]}<extra></extra>"
+                    ),
                 )
+            )
     if not candidates.empty and "ion" in candidates.columns:
         ion_palette = {
             "H+": "rgba(80, 200, 120, 0.9)",
             "Na+": "rgba(80, 120, 255, 0.9)",
             "K+": "rgba(255, 120, 80, 0.9)",
         }
+        # A measured peak can match many compositions/adducts. Plotting every
+        # row stacks multiple interactive dots on the same spectrum line and
+        # creates a very large browser payload. Keep the full candidate table,
+        # but draw only the highest-intensity candidate in each 0.01-Da line.
+        # For intensity ties, prefer the candidate with the smallest mass error.
+        plotted_candidates = candidates[candidates["ion"].isin(show_ions)].copy()
+        plotted_candidates = plotted_candidates[plotted_candidates["mz"] >= view_mz_min]
+        if view_mz_max is not None:
+            plotted_candidates = plotted_candidates[plotted_candidates["mz"] <= view_mz_max]
+        if not plotted_candidates.empty:
+            plotted_candidates["_plot_bin"] = (
+                plotted_candidates["mz"] / 0.01
+            ).round().astype("int64")
+            plotted_candidates["_abs_mz_diff"] = plotted_candidates["mz_diff"].abs()
+            plotted_candidates = (
+                plotted_candidates.sort_values(
+                    ["intensity", "_abs_mz_diff"],
+                    ascending=[False, True],
+                    kind="stable",
+                )
+                .drop_duplicates("_plot_bin", keep="first")
+                .sort_values("mz", kind="stable")
+            )
+
         for ion in show_ions:
-            sub = candidates[candidates["ion"] == ion]
-            if sub.empty:
-                continue
-            # Chart-only window for candidate markers too.
-            sub = sub[sub["mz"] >= mz_min]
-            if mz_max is not None:
-                sub = sub[sub["mz"] <= mz_max]
+            sub = plotted_candidates[plotted_candidates["ion"] == ion]
             if sub.empty:
                 continue
             fig.add_trace(
-                graph_objects.Scatter(
+                graph_objects.Scattergl(
                     x=sub["mz"],
                     y=sub["intensity"],
                     mode="markers",
@@ -533,9 +540,19 @@ def _spectrum_plot(
                     ),
                 )
             )
-    if peaks and mz_max is not None and mz_max > mz_min:
+    if visible_peaks:
+        data_mz_min = min(peak.mz for peak in visible_peaks)
+        data_mz_max = max(peak.mz for peak in visible_peaks)
+        noise_mz_max = min(data_mz_max, 5050.0)
+    else:
+        data_mz_min = view_mz_min
+        data_mz_max = (
+            view_mz_max if view_mz_max is not None else view_mz_min + 1.0
+        )
+        noise_mz_max = data_mz_min
+    if visible_peaks and noise_mz_max > data_mz_min:
         noise_mz, noise_floor, noise_uncertain = noise_floor_profile(
-            peaks, mz_min, mz_max
+            peaks, data_mz_min, noise_mz_max
         )
         trusted_floor = [
             None if uncertain else floor
@@ -582,17 +599,28 @@ def _spectrum_plot(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         # "closest" hover: the tooltip only appears for the nearest
         # single point to the cursor (no cross-trace unified bar).
-        # Combined with the spectrum trace's hoverinfo="skip" above,
-        # this means the user only ever sees one candidate dot's
-        # info -- the top dot at the cursor's m/z.
+        # Every raw peak and candidate is hoverable; "closest" keeps
+        # the tooltip focused on the single nearest point.
         hovermode="closest",
         showlegend=True,
     )
-    # Plotly's autorange adds proportional padding, which leaves a large
-    # empty band before the first peak on wide windows such as 600-5000.
-    # Pin the axis to the user's selected analysis limits instead.
-    if mz_max is not None and mz_max > mz_min:
-        fig.update_xaxes(range=[mz_min, mz_max])
+    # Use the actual data extent inside the selected window so an empty
+    # 0-600 prefix (or any other empty prefix/suffix) is never displayed.
+    if data_mz_max > data_mz_min:
+        fig.update_xaxes(range=[data_mz_min, data_mz_max])
+    else:
+        single_pad = max(
+            1.0, ((view_mz_max or data_mz_min + 100.0) - view_mz_min) * 0.005
+        )
+        fig.update_xaxes(
+            range=[data_mz_min - single_pad, data_mz_min + single_pad]
+        )
+    if auto_zoom_detail and visible_peaks:
+        detail_ceiling = float(
+            pd.Series([peak.intensity for peak in visible_peaks]).quantile(0.95)
+        ) * 1.10
+        if detail_ceiling > 0:
+            fig.update_yaxes(range=[0.0, detail_ceiling])
     # Hide the Plotly modebar (zoom, pan, autoscale, etc.).
     fig.update_layout(modebar=dict(remove=["zoom", "pan", "select", "lasso", "resetScale", "autoScale"]))
 
@@ -744,6 +772,18 @@ def _render_spectrum(
             default=[],
             key=f"plot_label_fields::{key_suffix}::{label}",
         )
+
+    auto_zoom_widget = f"plot_auto_zoom::{key_suffix}::{label}"
+    auto_zoom_detail = st.toggle(
+        "Auto-zoom 1000-5050 m/z (detail scale)",
+        value=st.session_state.get(auto_zoom_widget, False),
+        key=auto_zoom_widget,
+        help=(
+            "Show only observed peaks between 1000 and 5050 m/z and scale "
+            "the y-axis to the 95th-percentile intensity so a few very large "
+            "peaks do not flatten the smaller details. Scoring is unchanged."
+        ),
+    )
 
     style = st.session_state[_style_key]
 
@@ -1057,14 +1097,10 @@ def _render_spectrum(
             # 1000 m/z.
             mz_min=float(st.session_state.get("sidebar_mz_lo", 1000.0)),
             mz_max=float(st.session_state.get("sidebar_mz_hi", 10000.0)),
+            auto_zoom_detail=auto_zoom_detail,
             measure_lines=(_measure_state.get("A"), _measure_state.get("B")),
-            # Threshold for hover tooltips on the spectrum trace:
-            # peaks at or above the sidebar's minimum intensity show
-            # their m/z + intensity on hover; peaks below the
-            # threshold are drawn (so the user can see them) but
-            # have no tooltip so the mouse doesn't get cluttered
-            # with low-signal noise spikes. Defaults to 0.0 (no
-            # hover) if the sidebar hasn't been rendered yet.
+            # Every peak is now hoverable/selectable; this threshold is
+            # included in its diagnostic metadata rather than hiding it.
             hover_min_intensity=float(
                 st.session_state.get("sidebar_min_intensity", 0.0)
             ),
@@ -1077,13 +1113,80 @@ def _render_spectrum(
         _ions_sig = ",".join(show_ions) if show_ions else "none"
         _a_sig = "A" if _measure_state.get("A") is not None else "-"
         _b_sig = "B" if _measure_state.get("B") is not None else "-"
-        _plot_key = f"{plot_key}::{_ions_sig}::{_a_sig}{_b_sig}::{_param_hash}"
-        st.plotly_chart(
+        _zoom_sig = "detail" if auto_zoom_detail else "full"
+        _plot_key = (
+            f"{plot_key}::{_ions_sig}::{_a_sig}{_b_sig}::"
+            f"{_zoom_sig}::{_param_hash}"
+        )
+        plot_event = st.plotly_chart(
             fig,
             use_container_width=True,
             key=_plot_key,
+            on_select="rerun",
+            selection_mode="points",
             config={"displayModeBar": False},
         )
+
+        selected_points = plot_event.selection.get("points", [])
+        if selected_points:
+            point = selected_points[-1]
+            try:
+                selected_mz = float(point["x"])
+                selected_intensity = float(point["y"])
+            except (KeyError, TypeError, ValueError):
+                selected_mz = float("nan")
+                selected_intensity = float("nan")
+            nearest_peak = (
+                min(peaks, key=lambda peak: abs(peak.mz - selected_mz))
+                if peaks and math.isfinite(selected_mz)
+                else None
+            )
+            if nearest_peak is not None and abs(nearest_peak.mz - selected_mz) <= 0.01:
+                selected_floor, selected_uncertain = noise_floor_values(
+                    peaks, [nearest_peak.mz]
+                )
+                floor = selected_floor[0]
+                sn_ratio = (
+                    nearest_peak.intensity / floor if floor > 0 else float("inf")
+                )
+                scan_text = (
+                    f" · scan {nearest_peak.scan_id}"
+                    if nearest_peak.scan_id is not None
+                    else ""
+                )
+                st.info(
+                    f"Selected peak: **m/z {nearest_peak.mz:.4f}** · "
+                    f"**intensity {nearest_peak.intensity:.1f}** · "
+                    f"noise floor {floor:.1f} "
+                    f"({'uncertain' if selected_uncertain[0] else 'trusted'}) · "
+                    f"S/N {sn_ratio:.2f}{scan_text}"
+                )
+                matching_candidates = candidates[
+                    (candidates["mz"] - nearest_peak.mz).abs() <= 0.01
+                ] if not candidates.empty and "mz" in candidates.columns else pd.DataFrame()
+                shown_in_table = (
+                    not display_df.empty
+                    and "mz" in display_df.columns
+                    and bool(((display_df["mz"] - nearest_peak.mz).abs() <= 0.01).any())
+                )
+                if matching_candidates.empty:
+                    st.caption(
+                        "This is a raw spectrum peak with no matched candidate row."
+                    )
+                else:
+                    status = "shown in the table" if shown_in_table else "not shown by the current table filters"
+                    summary_columns = [
+                        column for column in (
+                            "mz", "intensity", "n_galnac", "n_gal", "ion",
+                            "mz_diff", "tier", "screen_notes",
+                        ) if column in matching_candidates.columns
+                    ]
+                    st.caption(f"Candidate information ({status}):")
+                    st.dataframe(
+                        matching_candidates[summary_columns],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
         # In measure mode, show the current A/B m/z + |B-A| delta
         # so the user can see the measurement at a glance. The

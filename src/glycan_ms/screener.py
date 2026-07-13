@@ -563,12 +563,24 @@ def noise_floor_profile(
     """
     if mz_max <= mz_min or points < 2:
         return [], [], []
-    model = _build_noise_floor_model(peaks)
     x_values = np.linspace(mz_min, mz_max, points, dtype=float).tolist()
+    floors, uncertain = noise_floor_values(peaks, x_values)
     return (
         x_values,
-        [model.floor_at(value) for value in x_values],
-        [model.is_uncertain(value) for value in x_values],
+        floors,
+        uncertain,
+    )
+
+
+def noise_floor_values(
+    peaks: Sequence[Peak],
+    mz_values: Sequence[float],
+) -> tuple[list[float], list[bool]]:
+    """Return scoring floors and uncertainty flags for arbitrary m/z values."""
+    model = _build_noise_floor_model(peaks)
+    return (
+        [model.floor_at(value) for value in mz_values],
+        [model.is_uncertain(value) for value in mz_values],
     )
 
 
