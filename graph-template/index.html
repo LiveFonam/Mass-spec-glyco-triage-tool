@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Glycan Peak &amp; Proportion Graph Template</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.plot.ly/plotly-3.6.0.min.js" charset="utf-8"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <p class="eyebrow">GLYCAN VISUALIZATION</p>
+      <h1>Peak &amp; Proportion Graph Template</h1>
+      <p class="lede">Import characteristic sugar peaks and create consistent, publication-ready figures.</p>
+    </div>
+    <div id="runtime-badge" class="runtime-badge">CDN edition</div>
+  </header>
+
+  <main>
+    <section class="panel import-panel" aria-labelledby="import-heading">
+      <div class="section-heading">
+        <div><p class="step">1</p><div><h2 id="import-heading">Load data</h2><p>Use TXT, CSV, XLS, XLSX, or paste six-line records.</p></div></div>
+      </div>
+      <div class="import-grid">
+        <label class="file-drop" id="file-drop">
+          <input id="file-input" type="file" multiple accept=".txt,.csv,.tsv,.xls,.xlsx,text/plain,text/csv">
+          <span class="drop-icon">＋</span><strong>Choose files or drop them here</strong>
+          <small>Excel imports the first sheet and ignores unrelated columns.</small>
+        </label>
+        <div class="paste-card">
+          <label for="paste-name">Pasted dataset title</label><input id="paste-name" type="text" value="Pasted Dataset">
+          <label for="paste-input">Paste data</label>
+          <textarea id="paste-input" rows="9" spellcheck="false" placeholder="892.2627563&#10;16213&#10;1&#10;4&#10;5&#10;Na+&#10;1095.312378&#10;4601&#10;2&#10;4&#10;6&#10;Na+"></textarea>
+          <p class="field-help">Updates automatically. CSV-style rows and common column-header variants are also accepted.</p>
+        </div>
+      </div>
+      <div id="global-messages" class="messages" aria-live="polite"></div>
+    </section>
+
+    <section class="panel controls-panel" aria-labelledby="controls-heading">
+      <div class="section-heading compact">
+        <div><p class="step">2</p><div><h2 id="controls-heading">Layout &amp; export</h2><p>Settings apply across datasets for consistent comparisons.</p></div></div>
+      </div>
+      <div class="control-grid">
+        <label>Dataset layout<select id="layout-mode"><option value="grid" selected>Two-column grid</option><option value="stack">Stacked vertically</option><option value="tabs">Tabs</option></select></label>
+        <label>Peak x-axis<select id="x-mode"><option value="auto" selected>Automatic shared range</option><option value="manual">Manual shared range</option></select></label>
+        <label>Minimum m/z<input id="x-min" type="number" step="any" placeholder="Auto" disabled></label>
+        <label>Maximum m/z<input id="x-max" type="number" step="any" placeholder="Auto" disabled></label>
+        <label>PNG width<input id="png-width" type="number" min="400" max="10000" step="10" value="1920"></label>
+        <label>PNG height<input id="png-height" type="number" min="300" max="10000" step="10" value="1080"></label>
+      </div>
+      <div class="export-row">
+        <button id="export-separate" class="button secondary" type="button">Download selected PNGs</button>
+        <button id="export-zip" class="button primary" type="button">Download selected as ZIP</button>
+        <span id="selection-count" class="selection-count">0 graphs selected</span>
+      </div>
+    </section>
+
+    <section id="palette-panel" class="panel palette-panel hidden" aria-labelledby="palette-heading">
+      <div class="section-heading compact">
+        <div><p class="step">3</p><div><h2 id="palette-heading">Composition colors</h2><p>Colors are consistent across datasets and editable.</p></div></div>
+        <button id="reset-colors" class="button ghost" type="button">Reset colors</button>
+      </div>
+      <div id="palette-editor" class="palette-editor"></div>
+    </section>
+
+    <nav id="dataset-tabs" class="dataset-tabs hidden" aria-label="Dataset tabs"></nav>
+    <section id="datasets" class="datasets grid-layout" aria-live="polite">
+      <div id="empty-state" class="empty-state"><div class="empty-symbol">⌁</div><h2>No datasets loaded</h2><p>Upload a file or paste records above to generate graphs.</p></div>
+    </section>
+  </main>
+
+  <template id="dataset-template">
+    <article class="dataset-card">
+      <header class="dataset-card-header">
+        <div class="dataset-title-fields">
+          <label>Dataset title<input class="dataset-title" type="text"></label>
+          <label>Optional subtitle<input class="dataset-subtitle" type="text" placeholder="Add experiment details or notes"></label>
+        </div>
+        <button class="remove-dataset button danger ghost" type="button">Remove</button>
+      </header>
+      <div class="dataset-settings">
+        <label class="check-label"><input class="show-peaks" type="checkbox" checked> Show peaks</label>
+        <label class="check-label"><input class="show-proportions" type="checkbox" checked> Show proportions</label>
+        <label>Peak intensity<select class="normalization-mode"><option value="raw">Raw</option><option value="normalized">Normalize maximum to 100%</option></select></label>
+        <label>Duplicate m/z within 0.01<select class="dedup-mode"><option value="highest" selected>Keep highest intensity</option><option value="sum">Sum intensities</option><option value="all">Keep all records</option></select></label>
+      </div>
+      <details class="axis-label-details"><summary>Edit axis labels</summary><div class="axis-label-grid">
+        <label>Peak X-axis<input class="peak-x-label" type="text"></label>
+        <label>Peak Y-axis<input class="peak-y-label" type="text"></label>
+        <label>Proportions X-axis<input class="proportion-x-label" type="text"></label>
+        <label>Proportions Y-axis<input class="proportion-y-label" type="text"></label>
+      </div></details>
+      <div class="dataset-summary"></div><div class="dataset-warnings messages"></div>
+
+      <section class="graph-section peaks-section">
+        <div class="graph-heading"><div><h3>Characteristic Sugar Peaks</h3><p>Thin peak sticks with m/z labels and complete hover details.</p></div>
+          <div class="graph-actions"><label class="check-label"><input class="select-peak-export" type="checkbox"> Select for export</label><button class="export-peak button secondary small" type="button">PNG</button></div></div>
+        <div class="peak-plot plot"></div>
+      </section>
+      <section class="graph-section proportions-section">
+        <div class="graph-heading"><div><h3>Composition Proportions</h3><p>Signal fraction by degree of polymerization and exact composition.</p></div>
+          <div class="graph-actions"><label class="check-label"><input class="select-proportion-export" type="checkbox"> Select for export</label><button class="export-proportion button secondary small" type="button">PNG</button></div></div>
+        <div class="proportion-plot plot"></div>
+      </section>
+      <details class="data-details"><summary>Parsed data table</summary><div class="table-wrap"><table><thead><tr><th>m/z</th><th>Intensity</th><th>GalNAc</th><th>Gal</th><th>Total</th><th>Ion</th></tr></thead><tbody class="data-table-body"></tbody></table></div></details>
+    </article>
+  </template>
+  <script src="app.js"></script>
+</body>
+</html>

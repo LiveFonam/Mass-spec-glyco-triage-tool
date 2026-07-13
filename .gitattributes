@@ -1,0 +1,4 @@
+# Preserve checksum-verified third-party assets and generated offline bundles
+# byte-for-byte without applying repository whitespace diagnostics.
+graph-template/vendor/*.js -whitespace
+graph-template/index-offline.html -whitespace

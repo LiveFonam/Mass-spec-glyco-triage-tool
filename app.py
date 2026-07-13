@@ -18,6 +18,7 @@ import re
 import sys
 import tempfile
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
@@ -146,46 +147,159 @@ def _df_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def _pngs_to_zip_bytes(folder_name: str, files: dict[str, bytes]) -> bytes:
+    """Package one or more PNG payloads inside a single folder in a ZIP."""
+    buffer = io.BytesIO()
+    safe_folder = _safe_filename(folder_name)
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_STORED) as archive:
+        for filename, payload in files.items():
+            archive.writestr(f"{safe_folder}/{_safe_filename(filename)}", payload)
+    return buffer.getvalue()
+
+
 def _download_buttons(
     fig,
     df: pd.DataFrame,
     sample_name: str,
     key_suffix: str,
+    *,
+    characteristic_fig,
+    proportion_fig,
+    export_signature: str,
 ) -> None:
-    """Render the PNG + XLSX download buttons for a spectrum render.
+    """Render on-demand PNG preparation plus visible graph/XLSX downloads.
 
-    The PNG is the on-screen plot (with Na+/K+ hide-state, measure
-    lines, hover tooltips baked in). The XLSX is the on-screen
-    candidate table -- whatever the user has filtered down to is
-    what they get in the file. Both buttons share the same
-    session_state key namespace (``download_png::`` /
-    ``download_xlsx::``) already declared in ``_PREFIXES`` so a file
-    removal wipes them.
+    PNG rendering is deliberately user-triggered. Generating three Kaleido
+    images on every row-edit rerun made the analyser feel slow. A prepared set
+    is cached in session state and invalidated whenever the graph signature
+    changes. The XLSX remains immediately available.
     """
     safe = _safe_filename(sample_name)
-    col_png, col_xlsx = st.columns(2)
-    with col_png:
-        png_bytes = _fig_to_png_bytes(fig)
-        if png_bytes:
-            st.download_button(
-                "Download PNG",
-                data=png_bytes,
-                file_name=f"{safe}_spectrum.png",
-                mime="image/png",
-                key=f"download_png::{key_suffix}::{sample_name}",
-                use_container_width=True,
-            )
-    with col_xlsx:
+    graph_definitions = {
+        "spectrum": {
+            "label": "Raw analyser spectrum",
+            "figure": fig,
+            "filename": f"{safe}_spectrum.png",
+        },
+        "peaks": {
+            "label": "Characteristic sugar peaks",
+            "figure": characteristic_fig,
+            "filename": f"{safe}_characteristic_peaks.png",
+        },
+        "proportions": {
+            "label": "Composition proportions",
+            "figure": proportion_fig,
+            "filename": f"{safe}_composition_proportions.png",
+        },
+    }
+    label_to_kind = {
+        definition["label"]: kind for kind, definition in graph_definitions.items()
+    }
+    prepared_key = f"prepared_graph_downloads::{key_suffix}::{sample_name}"
+    prepared = st.session_state.get(prepared_key)
+    if not isinstance(prepared, dict) or prepared.get("signature") != export_signature:
+        prepared = None
+        st.session_state.pop(prepared_key, None)
+
+    st.subheader("Downloads")
+    selected_labels = st.multiselect(
+        "Graphs to prepare or package",
+        options=list(label_to_kind),
+        default=list(label_to_kind),
+        key=f"selected_graph_downloads::{key_suffix}::{sample_name}",
+        help="Select one graph, several graphs, or all three. A ZIP can contain any selected combination, including one graph.",
+    )
+    selected_kinds = [label_to_kind[label] for label in selected_labels]
+    prepare_col, xlsx_col = st.columns(2)
+    with prepare_col:
+        prepare_clicked = st.button(
+            "Prepare selected PNG downloads",
+            key=f"prepare_graph_downloads::{key_suffix}::{sample_name}::{export_signature}",
+            type="primary",
+            use_container_width=True,
+            disabled=not selected_kinds,
+            help="Creates only the selected PNG files. Prepared files remain ready until the curated data or graph settings change.",
+        )
+    with xlsx_col:
         if not df.empty:
             xlsx_bytes = _df_to_xlsx_bytes(df)
             st.download_button(
-                "Download XLSX",
+                "Download retained rows (XLSX)",
                 data=xlsx_bytes,
                 file_name=f"{safe}_candidates.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"download_xlsx::{key_suffix}::{sample_name}",
+                key=f"download_xlsx::{key_suffix}::{sample_name}::{export_signature}",
                 use_container_width=True,
             )
+    if prepare_clicked:
+        images = dict(prepared.get("images", {})) if prepared else {}
+        with st.spinner(f"Preparing {len(selected_kinds)} selected PNG file(s)..."):
+            for kind in selected_kinds:
+                images[kind] = _fig_to_png_bytes(graph_definitions[kind]["figure"])
+        prepared = {"signature": export_signature, "images": images}
+        st.session_state[prepared_key] = prepared
+
+    if prepared is None:
+        st.caption(
+            "Choose one or more graphs, then click **Prepare selected PNG downloads**. "
+            "You can download each prepared graph separately or package the current selection into one ZIP folder. "
+            "The camera icon in each publication graph also downloads directly in the browser."
+        )
+        return
+
+    images = prepared.get("images", {})
+    st.markdown("**Individual prepared files**")
+    download_columns = st.columns(3)
+    missing: list[str] = []
+    for column, (kind, definition) in zip(download_columns, graph_definitions.items()):
+        payload = images.get(kind, b"")
+        with column:
+            if payload:
+                st.download_button(
+                    f"Download {definition['label']} PNG",
+                    data=payload,
+                    file_name=definition["filename"],
+                    mime="image/png",
+                    key=f"download_{kind}_png::{key_suffix}::{sample_name}::{export_signature}",
+                    use_container_width=True,
+                )
+            elif kind in selected_kinds:
+                missing.append(kind)
+    if missing:
+        st.warning(
+            "Selected but not prepared: "
+            + ", ".join(graph_definitions[kind]["label"] for kind in missing)
+            + ". Click Prepare selected PNG downloads; if rendering fails, use the graph's camera icon."
+        )
+
+    selected_payloads = {
+        kind: images.get(kind, b"") for kind in selected_kinds
+    }
+    zip_ready = bool(selected_payloads) and all(selected_payloads.values())
+    if zip_ready:
+        folder_name = f"{safe}_graphs"
+        zip_bytes = _pngs_to_zip_bytes(
+            folder_name,
+            {
+                graph_definitions[kind]["filename"]: payload
+                for kind, payload in selected_payloads.items()
+            },
+        )
+        count = len(selected_payloads)
+        st.download_button(
+            f"Download selected as ZIP ({count} graph{'s' if count != 1 else ''})",
+            data=zip_bytes,
+            file_name=f"{folder_name}.zip",
+            mime="application/zip",
+            key=f"download_graph_zip::{key_suffix}::{sample_name}::{export_signature}::{','.join(selected_kinds)}",
+            type="primary",
+            use_container_width=True,
+            help="The ZIP contains one folder holding exactly the currently selected graph PNGs. Selecting one graph creates a one-graph ZIP.",
+        )
+    elif selected_kinds:
+        st.caption(
+            "Prepare every currently selected graph before downloading that selection as a ZIP."
+        )
 
 
 def _load_spectrums(
@@ -371,6 +485,269 @@ def _composed_label(stem: str, sheet: str | None = None) -> str:
 def _field_text(text: str) -> str:
     """Strip the leading +1 GalNAc / +1 Gal / etc. labels for compact display."""
     return text
+
+
+def _with_candidate_row_ids(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with stable IDs used by the interactive remove control.
+
+    IDs are derived from the scientific row values plus an occurrence counter,
+    so they remain stable across Streamlit reruns and ordinary table filters.
+    The helper column is hidden from the user and excluded from downloads.
+    """
+    result = df.copy()
+    if result.empty:
+        result["_candidate_row_id"] = pd.Series(dtype="object")
+        return result
+    identity_columns = [
+        column for column in (
+            "mz", "intensity", "n_galnac", "n_gal", "total", "ion", "mz_diff"
+        ) if column in result.columns
+    ]
+    occurrences: dict[str, int] = {}
+    row_ids: list[str] = []
+    for values in result[identity_columns].itertuples(index=False, name=None):
+        normalized = "|".join(
+            "" if pd.isna(value) else format(value, ".12g") if isinstance(value, float) else str(value)
+            for value in values
+        )
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        occurrence = occurrences.get(digest, 0)
+        occurrences[digest] = occurrence + 1
+        row_ids.append(f"{digest}:{occurrence}")
+    result["_candidate_row_id"] = row_ids
+    return result
+
+
+_COMPOSITION_COLORS = (
+    "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9",
+    "#F0E442", "#332288", "#44AA99", "#117733", "#999933", "#CC6677",
+)
+
+
+def _curated_peak_rows(candidates: pd.DataFrame) -> pd.DataFrame:
+    """Keep only the strongest retained candidate within each 0.01 m/z line."""
+    if candidates.empty or not {"mz", "intensity"}.issubset(candidates.columns):
+        return candidates.copy()
+    sorted_rows = candidates.sort_values(
+        ["mz", "intensity"], ascending=[True, False], kind="stable"
+    )
+    keep_indices: list[Any] = []
+    cluster: list[Any] = []
+    anchor: float | None = None
+    for row_index, row in sorted_rows.iterrows():
+        mz = float(row["mz"])
+        if anchor is None or mz - anchor <= 0.010000001:
+            cluster.append(row_index)
+            anchor = mz if anchor is None else anchor
+            continue
+        keep_indices.append(
+            max(cluster, key=lambda index: float(sorted_rows.loc[index, "intensity"]))
+        )
+        cluster = [row_index]
+        anchor = mz
+    if cluster:
+        keep_indices.append(
+            max(cluster, key=lambda index: float(sorted_rows.loc[index, "intensity"]))
+        )
+    return sorted_rows.loc[keep_indices].sort_values("mz", kind="stable").copy()
+
+
+def _characteristic_peaks_plot(
+    candidates: pd.DataFrame,
+    label: str,
+    *,
+    normalize: bool = False,
+) -> graph_objects.Figure:
+    """Build the clean publication peak graph from retained table rows."""
+    rows = _curated_peak_rows(candidates)
+    fig = graph_objects.Figure()
+    if rows.empty:
+        fig.add_annotation(
+            text="No retained candidates to plot.",
+            x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
+        )
+        fig.update_layout(
+            title=f"{label} — Characteristic Sugar Peaks",
+            template="simple_white", height=430,
+        )
+        return fig
+    maximum = max(float(rows["intensity"].max()), 1.0)
+    y_values = [
+        float(value) / maximum * 100 if normalize else float(value)
+        for value in rows["intensity"]
+    ]
+    line_x: list[float | None] = []
+    line_y: list[float | None] = []
+    for mz, intensity in zip(rows["mz"], y_values):
+        line_x.extend([float(mz), float(mz), None])
+        line_y.extend([0.0, intensity, None])
+    fig.add_trace(graph_objects.Scatter(
+        x=line_x,
+        y=line_y,
+        mode="lines",
+        line=dict(color="rgba(70, 76, 82, 0.70)", width=1),
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+    hover_columns = [
+        column for column in ("intensity", "n_galnac", "n_gal", "total", "ion")
+        if column in rows.columns
+    ]
+    customdata = rows[hover_columns].to_numpy()
+    fig.add_trace(graph_objects.Scatter(
+        x=rows["mz"],
+        y=y_values,
+        mode="markers+text",
+        marker=dict(size=6, color="#555b61"),
+        text=[f"{float(mz):.4f}".rstrip("0").rstrip(".") for mz in rows["mz"]],
+        textposition="top center",
+        textfont=dict(size=9, color="#4a5056"),
+        customdata=customdata,
+        cliponaxis=False,
+        showlegend=False,
+        hovertemplate=(
+            "m/z %{x:.4f}<br>"
+            "intensity %{customdata[0]:,.2f}<br>"
+            "GalNAc %{customdata[1]}<br>"
+            "Gal %{customdata[2]}<br>"
+            "total %{customdata[3]}<br>"
+            "ion %{customdata[4]}<extra></extra>"
+        ),
+    ))
+    mz_min, mz_max = float(rows["mz"].min()), float(rows["mz"].max())
+    if mz_max <= mz_min:
+        mz_min, mz_max = mz_min - 1.0, mz_max + 1.0
+    else:
+        padding = (mz_max - mz_min) * 0.015
+        mz_min, mz_max = mz_min - padding, mz_max + padding
+    fig.update_layout(
+        title=f"{label} — Characteristic Sugar Peaks",
+        template="simple_white",
+        height=480,
+        dragmode="zoom",
+        hovermode="closest",
+        margin=dict(l=72, r=25, t=60, b=70),
+        xaxis=dict(title="m/z", range=[mz_min, mz_max]),
+        yaxis=dict(
+            title="Intensity (% of maximum)" if normalize else "Intensity",
+            ticksuffix="%" if normalize else "",
+            range=[0, max(max(y_values) * 1.15, 1.0)],
+        ),
+    )
+    return fig
+
+
+def _composition_proportion_plot(
+    candidates: pd.DataFrame,
+    label: str,
+) -> graph_objects.Figure:
+    """Build stacked signal proportions by DP from the retained candidates."""
+    fig = graph_objects.Figure()
+    required = {"intensity", "n_galnac", "n_gal", "total"}
+    if candidates.empty or not required.issubset(candidates.columns):
+        fig.add_annotation(
+            text="No retained candidates to summarize.",
+            x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
+        )
+        fig.update_layout(
+            title=f"{label} — Composition Proportions",
+            template="simple_white", height=430,
+        )
+        return fig
+
+    source = candidates.copy()
+    source = source[pd.to_numeric(source["intensity"], errors="coerce").notna()]
+    source["intensity"] = pd.to_numeric(source["intensity"], errors="coerce")
+    source = source[source["intensity"] >= 0]
+    grand_total = float(source["intensity"].sum())
+    if source.empty or grand_total <= 0:
+        fig.add_annotation(
+            text="Retained candidates have no positive signal.",
+            x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
+        )
+        fig.update_layout(
+            title=f"{label} — Composition Proportions",
+            template="simple_white", height=430,
+        )
+        return fig
+
+    grouped = (
+        source.groupby(["total", "n_galnac", "n_gal"], as_index=False, sort=True)["intensity"]
+        .sum()
+    )
+    dp_totals = grouped.groupby("total")["intensity"].sum().to_dict()
+    dp_min, dp_max = int(grouped["total"].min()), int(grouped["total"].max())
+    dps = list(range(dp_min, dp_max + 1))
+    compositions = sorted(
+        {(int(row.n_galnac), int(row.n_gal)) for row in grouped.itertuples()},
+        key=lambda composition: (composition[0], composition[1]),
+    )
+    for index, (n_galnac, n_gal) in enumerate(compositions):
+        subset = grouped[
+            (grouped["n_galnac"] == n_galnac) & (grouped["n_gal"] == n_gal)
+        ]
+        intensity_by_dp = dict(zip(subset["total"].astype(int), subset["intensity"]))
+        intensities = [float(intensity_by_dp.get(dp, 0.0)) for dp in dps]
+        within_dp = [
+            intensity / float(dp_totals[dp]) * 100 if dp_totals.get(dp) else 0.0
+            for dp, intensity in zip(dps, intensities)
+        ]
+        fig.add_trace(graph_objects.Bar(
+            x=dps,
+            y=[intensity / grand_total * 100 for intensity in intensities],
+            name=f"{n_galnac} GalNAc + {n_gal} Gal",
+            marker_color=_COMPOSITION_COLORS[index % len(_COMPOSITION_COLORS)],
+            text=[
+                "" if intensity <= 0 else f"{share:.0f}%" if share >= 10 else f"{share:.1f}%"
+                for intensity, share in zip(intensities, within_dp)
+            ],
+            textposition="inside",
+            customdata=list(zip(within_dp, intensities)),
+            hovertemplate=(
+                "DP %{x}<br>" + f"{n_galnac} GalNAc + {n_gal} Gal<br>"
+                "%{y:.2f}% of retained signal<br>"
+                "%{customdata[0]:.2f}% within DP<br>"
+                "summed intensity %{customdata[1]:,.2f}<extra></extra>"
+            ),
+        ))
+    annotations = [
+        dict(
+            x=dp,
+            y=float(dp_totals[dp]) / grand_total * 100,
+            text=f"<b>{float(dp_totals[dp]) / grand_total * 100:.1f}%</b>",
+            showarrow=False,
+            yshift=10,
+        )
+        for dp in dps if dp_totals.get(dp, 0) > 0
+    ]
+    max_share = max(float(dp_totals.get(dp, 0)) / grand_total * 100 for dp in dps)
+    fig.update_layout(
+        title=f"{label} — Composition Proportions",
+        template="simple_white",
+        height=480,
+        barmode="stack",
+        bargap=0.12,
+        dragmode="zoom",
+        hovermode="closest",
+        annotations=annotations,
+        uniformtext=dict(mode="show", minsize=8),
+        legend=dict(
+            orientation="h", x=0.5, xanchor="center", y=-0.25, yanchor="top",
+            title_text="Exact composition",
+        ),
+        margin=dict(l=70, r=25, t=55, b=125),
+        xaxis=dict(
+            title="Degree of Polymerization (DP)",
+            range=[dp_min - 0.5, dp_max + 0.5],
+            tickmode="linear", dtick=1,
+        ),
+        yaxis=dict(
+            title="Proportion of retained signal",
+            ticksuffix="%",
+            range=[0, max(max_share * 1.18, 1.0)],
+        ),
+    )
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +946,7 @@ def _spectrum_plot(
                     y=trusted_floor,
                     mode="lines",
                     name="Noise floor",
-                    line=dict(color="rgba(230, 150, 20, 0.9)", width=2, shape="hv"),
+                    line=dict(color="rgba(230, 150, 20, 0.9)", width=2),
                     hovertemplate="noise floor %{y:.1f}<br>m/z %{x:.1f}<extra></extra>",
                     connectgaps=False,
                 )
@@ -581,7 +958,7 @@ def _spectrum_plot(
                     y=uncertain_floor,
                     mode="lines",
                     name="Noise floor (uncertain)",
-                    line=dict(color="rgba(210, 80, 40, 0.9)", width=2, dash="dot", shape="hv"),
+                    line=dict(color="rgba(210, 80, 40, 0.9)", width=2, dash="dot"),
                     hovertemplate=(
                         "regional fallback %{y:.1f}<br>"
                         "m/z %{x:.1f}<br>local estimate uncertain<extra></extra>"
@@ -602,6 +979,10 @@ def _spectrum_plot(
         # Every raw peak and candidate is hoverable; "closest" keeps
         # the tooltip focused on the single nearest point.
         hovermode="closest",
+        # Streamlit's point-selection integration can otherwise switch the
+        # primary drag gesture to box selection. Keep a normal left-drag as
+        # Plotly zoom while retaining individual point clicks below.
+        dragmode="zoom",
         showlegend=True,
     )
     # Use the actual data extent inside the selected window so an empty
@@ -730,6 +1111,13 @@ def _render_spectrum(
 
     peaks: list[Peak] = list(sp.peaks)
     candidates: pd.DataFrame = st.session_state.get(_cand_storage_key, pd.DataFrame())
+    candidates_with_ids = _with_candidate_row_ids(candidates)
+    removed_key = f"removed_candidates::{key_suffix}::{label}::{_param_hash}"
+    removed_ids = list(st.session_state.get(removed_key, []))
+    removed_set = set(removed_ids)
+    retained_candidates = candidates_with_ids[
+        ~candidates_with_ids["_candidate_row_id"].isin(removed_set)
+    ].copy()
 
     # Per-spectrum controls
     rename_widget = f"spec_rename::{key_suffix}::{label}"
@@ -1031,7 +1419,7 @@ def _render_spectrum(
     # Apply the three hide toggles + the m/z search filter to the
     # displayed DataFrame. Each filter is independent and applied in
     # order: |m/z diff|, no envelope, no companion, m/z search.
-    display_df = candidates.copy()
+    display_df = retained_candidates.copy()
     if not display_df.empty and "mz_diff" in display_df.columns and hide_reds:
         display_df = display_df[display_df["mz_diff"].abs() <= RED_DA_THRESHOLD]
     if not display_df.empty and hide_no_envelope and "screen_notes" in display_df.columns:
@@ -1074,7 +1462,33 @@ def _render_spectrum(
             (display_df["mz"] >= _search_lo) & (display_df["mz"] <= _search_hi)
         ]
 
+    curate_col, undo_col, restore_col = st.columns([2, 1, 1])
+    with curate_col:
+        st.caption(
+            f"**Manual curation:** {len(retained_candidates)} retained · "
+            f"{len(removed_ids)} removed. Current table filters further control the graphs and downloads."
+        )
+    with undo_col:
+        if st.button(
+            "Undo last removal",
+            key=f"undo_removed::{key_suffix}::{label}::{_param_hash}",
+            disabled=not removed_ids,
+            use_container_width=True,
+        ):
+            st.session_state[removed_key] = removed_ids[:-1]
+            st.rerun()
+    with restore_col:
+        if st.button(
+            "Restore all",
+            key=f"restore_removed::{key_suffix}::{label}::{_param_hash}",
+            disabled=not removed_ids,
+            use_container_width=True,
+        ):
+            st.session_state[removed_key] = []
+            st.rerun()
+
     # Graph.
+    fig = graph_objects.Figure()
     if not peaks:
         st.empty_peaks_slot = st.empty()
         st.empty_peaks_slot.info("No peaks parsed from this file.")
@@ -1118,14 +1532,15 @@ def _render_spectrum(
             f"{plot_key}::{_ions_sig}::{_a_sig}{_b_sig}::"
             f"{_zoom_sig}::{_param_hash}"
         )
-        plot_event = st.plotly_chart(
-            fig,
-            use_container_width=True,
-            key=_plot_key,
-            on_select="rerun",
-            selection_mode="points",
-            config={"displayModeBar": False},
-        )
+        with st.expander("Raw analyser spectrum", expanded=True):
+            plot_event = st.plotly_chart(
+                fig,
+                use_container_width=True,
+                key=_plot_key,
+                on_select="rerun",
+                selection_mode="points",
+                config={"displayModeBar": False},
+            )
 
         selected_points = plot_event.selection.get("points", [])
         if selected_points:
@@ -1206,15 +1621,72 @@ def _render_spectrum(
             else:
                 st.caption("**Measure**: set A and B in the form above.")
 
+    st.subheader("Curated publication graphs")
+    st.caption(
+        "Use the camera icon in either graph's toolbar to export a 1920 × 1080 PNG."
+    )
+    normalize_curated = st.toggle(
+        "Normalize characteristic peaks to 100%",
+        value=st.session_state.get(
+            f"normalize_curated::{key_suffix}::{label}", False
+        ),
+        key=f"normalize_curated::{key_suffix}::{label}",
+    )
+    characteristic_fig = _characteristic_peaks_plot(
+        display_df, new_name, normalize=normalize_curated
+    )
+    with st.expander("Characteristic Sugar Peaks", expanded=True):
+        st.plotly_chart(
+            characteristic_fig,
+            use_container_width=True,
+            key=f"characteristic::{key_suffix}::{label}::{_param_hash}::{len(removed_ids)}::{normalize_curated}",
+            config={
+                "displayModeBar": True,
+                "displaylogo": False,
+                "scrollZoom": True,
+                "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+                "toImageButtonOptions": {
+                    "format": "png",
+                    "filename": f"{_safe_filename(new_name)}_characteristic_peaks",
+                    "width": 1920,
+                    "height": 1080,
+                    "scale": 1,
+                },
+            },
+        )
+    proportion_fig = _composition_proportion_plot(display_df, new_name)
+    with st.expander("Composition Proportions", expanded=True):
+        st.plotly_chart(
+            proportion_fig,
+            use_container_width=True,
+            key=f"proportions::{key_suffix}::{label}::{_param_hash}::{len(removed_ids)}",
+            config={
+                "displayModeBar": True,
+                "displaylogo": False,
+                "scrollZoom": True,
+                "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+                "toImageButtonOptions": {
+                    "format": "png",
+                    "filename": f"{_safe_filename(new_name)}_composition_proportions",
+                    "width": 1920,
+                    "height": 1080,
+                    "scale": 1,
+                },
+            },
+        )
+
     # Table.
     if display_df.empty:
         st.empty_table_slot = st.empty()
         st.empty_table_slot.info("No compositions matched within the current parameters.")
     else:
-        styled = _styled_candidates(
-            display_df,
+        editor_df = display_df.copy()
+        editor_df.insert(0, "_remove", False)
+        locked_columns = [column for column in editor_df.columns if column != "_remove"]
+        editor_styled = _styled_candidates(
+            editor_df,
             show_reds=True,
-            show_tiers="tier" in display_df.columns,
+            show_tiers="tier" in editor_df.columns,
         ).format(
             {
                 "mz": "{:.4f}",
@@ -1222,14 +1694,18 @@ def _render_spectrum(
                 "mz_diff": "{:.4f}",
             }
         )
-        if "mz_diff" in display_df.columns:
-            styled = styled.apply(_highlight_da, subset=["mz_diff"])
-        if "tier" in display_df.columns:
-            styled = styled.apply(_highlight_tier, subset=["tier"])
-        st.dataframe(
-            styled,
+        if "mz_diff" in editor_df.columns:
+            editor_styled = editor_styled.apply(_highlight_da, subset=["mz_diff"])
+        if "tier" in editor_df.columns:
+            editor_styled = editor_styled.apply(_highlight_tier, subset=["tier"])
+        edited_df = st.data_editor(
+            editor_styled,
             use_container_width=True,
             column_config={
+                "_remove": st.column_config.CheckboxColumn(
+                    "✕", help="Click to remove this candidate from graphs and downloads."
+                ),
+                "_candidate_row_id": None,
                 "mz": st.column_config.NumberColumn("m/z", format="%.4f"),
                 "intensity": st.column_config.NumberColumn("intensity", format="%.2f"),
                 "mz_diff": st.column_config.NumberColumn("off by", format="%.4f"),
@@ -1250,8 +1726,18 @@ def _render_spectrum(
                     "series length", format="%d"
                 ),
             },
-            key=f"table_{key_suffix}_{label}",
+            disabled=locked_columns,
+            hide_index=True,
+            key=f"table_{key_suffix}_{label}_{_param_hash}_{len(removed_ids)}",
         )
+        newly_removed = edited_df.loc[
+            edited_df["_remove"].fillna(False), "_candidate_row_id"
+        ].astype(str).tolist()
+        if newly_removed:
+            st.session_state[removed_key] = removed_ids + [
+                row_id for row_id in newly_removed if row_id not in removed_set
+            ]
+            st.rerun()
 
     if show_metrics and not display_df.empty and "mz_diff" in display_df.columns:
         st.caption(
@@ -1263,7 +1749,35 @@ def _render_spectrum(
     # plot (with Na+/K+ hide-state, measure lines, and any tier
     # styling), XLSX is the post-filter ``display_df`` so the file
     # contains only the rows the user is looking at.
-    _download_buttons(fig, display_df, label, key_suffix)
+    download_df = display_df.drop(columns=["_candidate_row_id"], errors="ignore")
+    export_measure = st.session_state.get(measure_state_key, {"A": None, "B": None})
+    retained_row_signature = ",".join(
+        display_df.get("_candidate_row_id", pd.Series(dtype="object")).astype(str)
+    )
+    export_signature = hashlib.sha256(
+        "|".join(
+            [
+                _param_hash,
+                new_name,
+                retained_row_signature,
+                ",".join(show_ions),
+                style,
+                str(auto_zoom_detail),
+                str(normalize_curated),
+                str(export_measure.get("A")),
+                str(export_measure.get("B")),
+            ]
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    _download_buttons(
+        fig,
+        download_df,
+        label,
+        key_suffix,
+        characteristic_fig=characteristic_fig,
+        proportion_fig=proportion_fig,
+        export_signature=export_signature,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1281,6 +1795,19 @@ _PREFIXES = (
     "compare_pick::",
     "download_png::",
     "download_xlsx::",
+    "download_spectrum_png::",
+    "download_peaks_png::",
+    "download_proportions_png::",
+    "prepare_graph_downloads::",
+    "prepared_graph_downloads::",
+    "selected_graph_downloads::",
+    "download_graph_zip::",
+    "proportions::",
+    "characteristic::",
+    "normalize_curated::",
+    "removed_candidates::",
+    "undo_removed::",
+    "restore_removed::",
     "spec_btn::",
     "plot_label_fields::",
     "hide_reds::",

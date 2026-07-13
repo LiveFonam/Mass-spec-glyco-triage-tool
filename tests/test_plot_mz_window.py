@@ -70,6 +70,7 @@ def test_spectrum_plot_uses_observed_extent_without_empty_prefix() -> None:
     spectrum = next(trace for trace in figure.data if trace.name == "Spectrum")
     assert spectrum.hoverinfo == "x+y"
     assert len(spectrum.customdata) == 2
+    assert figure.layout.dragmode == "zoom"
     noise_x = [
         value
         for trace in figure.data
@@ -190,6 +191,7 @@ def test_plotly_chart_enables_point_selection() -> None:
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "plotly_chart"
+        and any(keyword.arg == "on_select" for keyword in node.keywords)
     )
     keywords = {keyword.arg: keyword.value for keyword in chart_call.keywords}
 

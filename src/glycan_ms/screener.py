@@ -199,7 +199,11 @@ MIN_PEAKS_PER_BIN: Final[int] = 20
 # spectra where every peak is signal, so the multiplier now applies
 # only to the per-bin path.)
 NOISE_PERCENTILE: Final[float] = 0.20
-NOISE_MULTIPLIER: Final[float] = 1.8
+# A modest margin above the estimated lower background component. 1.8 placed
+# the displayed floor near the top of dense real-world background clouds and
+# over-rejected modest peaks; 1.64 retains a safety margin without treating most
+# of the background envelope as the minimum signal threshold.
+NOISE_MULTIPLIER: Final[float] = 1.64
 
 # Envelope thresholds. M+0 is the dominant peak; the M+1 satellite is
 # typically 5-20% as intense as M+0, M+2 is 1-3%, and M+3 is < 0.5%
@@ -260,6 +264,11 @@ ENVELOPE_SIGMA_FACTOR: Final[float] = 2.0
 # user's normal operating range.
 STRICT_ENVELOPE_MZ_LO: Final[float] = 1000.0
 STRICT_ENVELOPE_MZ_HI: Final[float] = 3800.0
+
+# M+3 is never required below this m/z. Small glycans in the sub-900 region
+# have an M+3 satellite that is too weak to be a reliable mandatory signal,
+# even when M+0 has high S/N or GalNAc outnumbers Gal.
+ENVELOPE_M3_MIN_MZ: Final[float] = 900.0
 
 # S/N thresholds for the strict window. M+0 intensity / noise_at_target
 # determines which satellite set is required:
@@ -431,14 +440,60 @@ class _NoiseFloorModel:
     fallback: float
     uncertain_bins: frozenset[int]
     regional_fallbacks: dict[str, float]
+    ordered_bins: tuple[int, ...]
 
     def floor_at(self, mz: float) -> float:
         idx = _bin_index(mz)
-        return self.cache.get(idx, self.regional_fallbacks.get(_noise_region(mz), self.fallback))
+        own_floor = self.cache.get(idx)
+        if own_floor is None:
+            return self.regional_fallbacks.get(_noise_region(mz), self.fallback)
+
+        # Interpolate between adjacent bin centres. A piecewise-constant
+        # lookup made the scientific threshold jump abruptly at 300-Da bin
+        # edges (most visibly around 1800 m/z), even when the underlying
+        # background changed gradually. Interpolation keeps the same robust
+        # per-bin estimates while making the scoring floor continuous.
+        position = bisect.bisect_left(self.ordered_bins, idx)
+        own_center = idx + _bin_width_for_lo(float(idx)) / 2.0
+        neighbour_position = position - 1 if mz < own_center else position + 1
+        if not (0 <= neighbour_position < len(self.ordered_bins)):
+            return own_floor
+        neighbour_idx = self.ordered_bins[neighbour_position]
+        max_spacing = max(
+            _bin_width_for_lo(float(idx)),
+            _bin_width_for_lo(float(neighbour_idx)),
+        )
+        if abs(neighbour_idx - idx) > max_spacing:
+            return own_floor
+        neighbour_floor = self.cache[neighbour_idx]
+        neighbour_center = (
+            neighbour_idx + _bin_width_for_lo(float(neighbour_idx)) / 2.0
+        )
+        span = abs(neighbour_center - own_center)
+        if span <= 0:
+            return own_floor
+        fraction = min(abs(mz - own_center) / span, 1.0)
+        return own_floor + (neighbour_floor - own_floor) * fraction
 
     def is_uncertain(self, mz: float) -> bool:
         idx = _bin_index(mz)
-        return idx not in self.cache or idx in self.uncertain_bins
+        if idx not in self.cache or idx in self.uncertain_bins:
+            return True
+        own_center = idx + _bin_width_for_lo(float(idx)) / 2.0
+        position = bisect.bisect_left(self.ordered_bins, idx)
+        neighbour_position = position - 1 if mz < own_center else position + 1
+        if 0 <= neighbour_position < len(self.ordered_bins):
+            neighbour_idx = self.ordered_bins[neighbour_position]
+            max_spacing = max(
+                _bin_width_for_lo(float(idx)),
+                _bin_width_for_lo(float(neighbour_idx)),
+            )
+            if (
+                abs(neighbour_idx - idx) <= max_spacing
+                and neighbour_idx in self.uncertain_bins
+            ):
+                return True
+        return False
 
 
 def _build_noise_floor_model(peaks: Sequence[Peak]) -> _NoiseFloorModel:
@@ -463,7 +518,9 @@ def _build_noise_floor_model(peaks: Sequence[Peak]) -> _NoiseFloorModel:
         all_pos.append(intensity)
 
     if not all_pos:
-        return _NoiseFloorModel({}, 1.0, frozenset(), {name: 1.0 for name in regions})
+        return _NoiseFloorModel(
+            {}, 1.0, frozenset(), {name: 1.0 for name in regions}, ()
+        )
 
     # A robust global fallback is meaningful only with enough observations.
     # Tiny synthetic/sparse spectra retain the lenient minimum but are marked
@@ -489,8 +546,9 @@ def _build_noise_floor_model(peaks: Sequence[Peak]) -> _NoiseFloorModel:
             raw[idx] = regional_fallbacks[_noise_region(float(idx))]
             uncertain.add(idx)
 
-    # Median smoothing uses only physically adjacent bins; it therefore
-    # removes boundary discontinuities without blending distant m/z regions.
+    # A centre-weighted mean uses only physically adjacent bins. Unlike the
+    # previous weighted median, it actually softens monotonic changes and
+    # isolated spikes while still giving the target bin twice the influence.
     ordered = sorted(raw)
     smoothed: dict[int, float] = {}
     for position, idx in enumerate(ordered):
@@ -505,13 +563,14 @@ def _build_noise_floor_model(peaks: Sequence[Peak]) -> _NoiseFloorModel:
             max_spacing = max(_bin_width_for_lo(float(idx)), _bin_width_for_lo(float(other)))
             if abs(other - idx) <= max_spacing:
                 neighbours.append(raw[other])
-        smoothed[idx] = float(np.median(neighbours))
+        smoothed[idx] = float(np.mean(neighbours))
 
     return _NoiseFloorModel(
         smoothed,
         float(global_fallback),
         frozenset(uncertain),
         regional_fallbacks,
+        tuple(ordered),
     )
 
 
@@ -585,7 +644,7 @@ def noise_floor_values(
 
 
 def _noise_floor_cached(
-    cache: dict[int, float],
+    cache: dict[int, float] | _NoiseFloorModel,
     target_mz: float,
     *,
     fallback: float | None = None,
@@ -604,6 +663,8 @@ def _noise_floor_cached(
     ``min(cache.values())`` heuristic. ``1.0`` matches the empty-
     spectrum sentinel returned by :func:`_noise_floor_for_mz`.
     """
+    if isinstance(cache, _NoiseFloorModel):
+        return cache.floor_at(target_mz)
     idx = _bin_index(target_mz)
     if idx in cache:
         return cache[idx]
@@ -1088,6 +1149,10 @@ def _score_envelope(
     # promote it.
     if n_galnac > n_gal:
         required_satellites = {1, 2, 3}
+    # Absolute low-mass exception: M+3 is never mandatory below 900 m/z,
+    # regardless of the S/N tier or GalNAc-dominance override above.
+    if target_mz < ENVELOPE_M3_MIN_MZ:
+        required_satellites.discard(3)
     observed_set = set(observed_isotopes)
     envelope_ok = m0_ok and required_satellites.issubset(observed_set)
 
@@ -1132,7 +1197,7 @@ def _score_companion(
     da_tol: float,
     noise_at_target: float,
     mz_max: float = float("inf"),
-    noise_cache: dict[int, float] | None = None,
+    noise_cache: dict[int, float] | _NoiseFloorModel | None = None,
     companion_tol_da: float = 0.75,
     noise_fallback: float | None = None,
 ) -> tuple[int, list[str], bool]:
@@ -1326,7 +1391,7 @@ def _score_series(
     sorted_mz: list[float],
     sorted_intensity: list[float],
     da_tol: float,
-    noise_cache: dict[int, float],
+    noise_cache: dict[int, float] | _NoiseFloorModel,
     mz_max: float = float("inf"),
     companion_tol_da: float = 0.75,
     noise_fallback: float | None = None,
@@ -1589,7 +1654,7 @@ def screen_candidates(
     # instead of an O(N) bin scan. This is the difference between
     # sub-second and multi-second renders on large spectra.
     noise_model = _build_noise_floor_model(spectrum_peaks)
-    noise_cache = noise_model.cache
+    noise_cache = noise_model
     noise_fallback = noise_model.fallback
 
     tiers: list[str] = []

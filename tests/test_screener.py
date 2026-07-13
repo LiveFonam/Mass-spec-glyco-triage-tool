@@ -231,7 +231,7 @@ def test_noise_floor_cache_uses_robust_global_fallback_on_miss() -> None:
     cache, fallback = _build_noise_floor_cache(peaks)
     # Sorted globally: 2, 10..39. The 20th-percentile rank is 6,
     # intensity 15; applying the 1.8 multiplier gives 27.
-    assert fallback == pytest.approx(27.0)
+    assert fallback == pytest.approx(15.0 * NOISE_MULTIPLIER)
     # The populated bin's floor at lo=900 is the 20th-percentile x
     # NOISE_MULTIPLIER; for these intensities (10..39) that's around
     # (17) * 1.8 = 30.6. Whatever the exact value, it's >> 2.0.
@@ -243,8 +243,8 @@ def test_noise_floor_cache_uses_robust_global_fallback_on_miss() -> None:
     # Querying an empty bin at m/z 6000 must return the robust global
     # fallback, not min(cache.values()).
     looked_up = _noise_floor_cached(cache, 6000.0, fallback=fallback)
-    assert looked_up == pytest.approx(27.0), (
-        f"cache miss must return the robust fallback (27.0); got {looked_up}. "
+    assert looked_up == pytest.approx(15.0 * NOISE_MULTIPLIER), (
+        f"cache miss must return the robust fallback; got {looked_up}. "
         f"Old behaviour would have returned {populated_bin_floor} (min of cache.values())."
     )
 
@@ -273,7 +273,7 @@ def test_sparse_low_mz_bin_uses_regional_floor_and_is_uncertain() -> None:
     sparse_target = Peak(mz=950.0, intensity=10_000.0)
     model = _build_noise_floor_model([*regional_background, sparse_target])
 
-    assert model.floor_at(950.0) == pytest.approx(180.0)
+    assert model.floor_at(950.0) == pytest.approx(100.0 * NOISE_MULTIPLIER)
     assert model.is_uncertain(950.0) is True
 
 
@@ -2392,6 +2392,32 @@ def test_score_envelope_galnac_dominance_requires_m3() -> None:
     )
 
 
+def test_score_envelope_below_900_never_requires_m3() -> None:
+    """Sub-900 candidates pass without M+3, even at high S/N and GalNAc dominance."""
+    target = 850.0
+    peaks = [
+        Peak(mz=target, intensity=10_000.0),
+        Peak(mz=target + 1.003355, intensity=2_000.0),
+        Peak(mz=target + 2 * 1.003355, intensity=500.0),
+    ]
+    sorted_mz, sorted_intensity = _sorted_mz_index(peaks)
+
+    ok, note, skipped = _score_envelope(
+        3,
+        1,
+        Adduct.NA,
+        sorted_mz,
+        sorted_intensity,
+        0.1,
+        target,
+        noise_at_target=100.0,
+    )
+
+    assert ok is True, note
+    assert skipped is False
+    assert "requires M+3" not in note
+
+
 def test_score_envelope_low_bar_is_1p09() -> None:
     """The LOW S/N envelope bar is exactly 1.09x noise.
 
@@ -3036,14 +3062,29 @@ def test_noise_floor_uses_150_da_bin_above_split() -> None:
     # per-bin floors (not the fallback).
     floor_below_split = _noise_floor_cached(cache, 2900.0)
     floor_above_split = _noise_floor_cached(cache, 3000.0)
-    # Each floor is 25th-percentile * 1.8 of its own bin's intensities.
-    # 2800-2950 bin: all 50, percentile = 50, floor = 50 * 1.8 = 90.
-    # 2950-3100 bin: all 100, percentile = 100, floor = 100 * 1.8 = 180.
-    assert floor_below_split == pytest.approx(90.0)
-    assert floor_above_split == pytest.approx(180.0)
+    # Each raw floor is the lower percentile times NOISE_MULTIPLIER,
+    # then the adjacent bins are softly centre-weighted (2:1).
+    low_raw = 50.0 * NOISE_MULTIPLIER
+    high_raw = 100.0 * NOISE_MULTIPLIER
+    assert floor_below_split == pytest.approx((2 * low_raw + high_raw) / 3)
+    assert floor_above_split == pytest.approx((2 * high_raw + low_raw) / 3)
     # And they must differ -- if the binning collapsed both into a
     # single 300-Da bin the two floors would be identical.
     assert floor_above_split != floor_below_split
+
+
+def test_noise_floor_is_continuous_at_1800_bin_boundary() -> None:
+    """Adjacent bins may differ, but scoring must not jump at their edge."""
+    peaks = (
+        [Peak(mz=1500.0 + i, intensity=100.0) for i in range(30)]
+        + [Peak(mz=1800.0 + i, intensity=300.0) for i in range(30)]
+    )
+    model = _build_noise_floor_model(peaks)
+
+    just_below = model.floor_at(1800.0 - 0.001)
+    just_above = model.floor_at(1800.0 + 0.001)
+
+    assert just_below == pytest.approx(just_above, rel=1e-5)
 
 
 def test_noise_floor_at_split_boundary() -> None:
