@@ -31,6 +31,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 import pandas as pd
 import plotly.graph_objects as graph_objects
 import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
 
 # Lift Streamlit's default Styler cell cap so large candidate tables
 # (e.g. mzXML files producing 100k+ candidate rows) can render with
@@ -188,6 +189,77 @@ def _graph_cart_zip_bytes(cart: dict[str, dict[str, Any]]) -> bytes:
     return _pngs_to_zip_bytes("all_prepared_glycan_graphs", files)
 
 
+def _compose_graph_grid_png(
+    payloads: Iterable[bytes],
+    title: str,
+) -> bytes:
+    """Combine one to four prepared graph PNGs into one titled grid PNG.
+
+    Two graphs are placed side by side. Three or four graphs use a two-column
+    grid. Images are scaled down, never up, and centered in equal-size cells so
+    a mixed selection of spectrum and composition plots stays aligned.
+    """
+    source_payloads = [bytes(payload) for payload in payloads if payload]
+    if not source_payloads:
+        return b""
+    if len(source_payloads) > 4:
+        raise ValueError("A combined graph PNG supports at most four graphs.")
+
+    images: list[Image.Image] = []
+    for payload in source_payloads:
+        with Image.open(io.BytesIO(payload)) as source:
+            image = source.convert("RGB")
+            image.thumbnail((1200, 750), Image.Resampling.LANCZOS)
+            images.append(image.copy())
+
+    columns = 1 if len(images) == 1 else 2
+    rows = math.ceil(len(images) / columns)
+    cell_width = max(image.width for image in images)
+    cell_height = max(image.height for image in images)
+    padding = 24
+    gap = 24
+    title_text = title.strip() or "Combined MS analyser graphs"
+    try:
+        title_font = ImageFont.truetype("arial.ttf", 46)
+    except OSError:
+        title_font = ImageFont.load_default(size=46)
+
+    measure_image = Image.new("RGB", (1, 1), "white")
+    measure_draw = ImageDraw.Draw(measure_image)
+    title_box = measure_draw.textbbox((0, 0), title_text, font=title_font)
+    title_height = max(title_box[3] - title_box[1], 46)
+    title_area = title_height + padding * 2
+    canvas_width = padding * 2 + columns * cell_width + (columns - 1) * gap
+    canvas_height = title_area + padding + rows * cell_height + (rows - 1) * gap + padding
+    canvas = Image.new("RGB", (canvas_width, canvas_height), "white")
+    draw = ImageDraw.Draw(canvas)
+    title_width = title_box[2] - title_box[0]
+    draw.text(
+        ((canvas_width - title_width) / 2, padding - title_box[1]),
+        title_text,
+        fill="#202124",
+        font=title_font,
+    )
+
+    grid_top = title_area + padding
+    for index, image in enumerate(images):
+        row, column = divmod(index, columns)
+        cell_x = padding + column * (cell_width + gap)
+        cell_y = grid_top + row * (cell_height + gap)
+        image_x = cell_x + (cell_width - image.width) // 2
+        image_y = cell_y + (cell_height - image.height) // 2
+        canvas.paste(image, (image_x, image_y))
+        draw.rectangle(
+            (cell_x, cell_y, cell_x + cell_width - 1, cell_y + cell_height - 1),
+            outline="#DADCE0",
+            width=2,
+        )
+
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
 def _download_buttons(
     fig,
     df: pd.DataFrame,
@@ -338,6 +410,64 @@ def _download_buttons(
         ]
     )
     st.dataframe(cart_table, use_container_width=True, hide_index=True)
+
+    panel_suffix = "" if key_suffix == "active" else " (comparison)"
+    with st.expander(
+        f"Combine graphs into one PNG{panel_suffix}",
+        expanded=False,
+    ):
+        st.caption(
+            "Pick up to four prepared graphs. Two are placed side by side; "
+            "three or four use a two-column grid. The preview is the exact PNG download."
+        )
+        composite_selection_key = f"composite_graph_selection::{dataset_id}"
+        if composite_selection_key in st.session_state:
+            st.session_state[composite_selection_key] = [
+                key
+                for key in st.session_state[composite_selection_key]
+                if key in cart
+            ][:4]
+        composite_keys = st.multiselect(
+            "Graphs to merge",
+            options=list(cart),
+            default=list(cart)[:4],
+            format_func=lambda key: (
+                f"{cart[key]['dataset_name']} - "
+                f"{graph_definitions.get(cart[key]['kind'], {}).get('label', cart[key]['kind'])}"
+            ),
+            max_selections=4,
+            key=composite_selection_key,
+        )
+        composite_title = st.text_input(
+            "Title for the combined PNG",
+            value="Combined MS analyser graphs",
+            key=f"composite_graph_title::{dataset_id}",
+        )
+        if composite_keys:
+            composite_png = _compose_graph_grid_png(
+                [cart[key]["payload"] for key in composite_keys],
+                composite_title,
+            )
+            st.image(
+                composite_png,
+                caption=f"Preview: {len(composite_keys)} graph(s) in one PNG",
+                width="stretch",
+            )
+            composite_signature = hashlib.sha256(
+                "|".join(composite_keys + [composite_title]).encode("utf-8")
+            ).hexdigest()[:12]
+            st.download_button(
+                "Download combined PNG",
+                data=composite_png,
+                file_name=f"{_safe_filename(composite_title or 'combined_graphs')}.png",
+                mime="image/png",
+                key=f"download_composite_png::{dataset_id}::{composite_signature}",
+                type="primary",
+                use_container_width=True,
+            )
+        else:
+            st.info("Select at least one prepared graph to see the combined preview.")
+
     remove_keys = st.multiselect(
         "Remove specific prepared files from the ZIP collection",
         options=list(cart),
@@ -602,7 +732,7 @@ _DEFAULT_GALNAC_GREEN = "#009E73"
 def _galnac_color_map(
     counts: Iterable[int],
     *,
-    mode: str = "gradient",
+    mode: str = "distinct",
     base_color: str = _DEFAULT_GALNAC_GREEN,
     distinct_colors: dict[int, str] | None = None,
 ) -> dict[int, str]:
@@ -751,7 +881,7 @@ def _composition_proportion_plot(
     candidates: pd.DataFrame,
     label: str,
     *,
-    color_mode: str = "gradient",
+    color_mode: str = "distinct",
     base_color: str = _DEFAULT_GALNAC_GREEN,
     distinct_colors: dict[int, str] | None = None,
 ) -> graph_objects.Figure:
@@ -1444,7 +1574,7 @@ def _render_spectrum(
     hide_reds_widget = f"hide_reds_widget_{key_suffix}_{label}"
     hide_reds: bool = st.checkbox(
         f"Hide |m/z diff| > {RED_DA_THRESHOLD:g} Da",
-        value=st.session_state.get(f"hide_reds::{label}", False),
+        value=st.session_state.get(f"hide_reds::{label}", True),
         key=hide_reds_widget,
         help=(
             f"Drop every candidate with |m/z diff| > {RED_DA_THRESHOLD:g} Da "
@@ -1470,7 +1600,7 @@ def _render_spectrum(
     hide_no_companion_widget = f"hide_no_companion_widget_{key_suffix}_{label}"
     hide_no_companion: bool = st.checkbox(
         "Hide if no companion peak found",
-        value=st.session_state.get(f"hide_no_companion::{label}", False),
+        value=st.session_state.get(f"hide_no_companion::{label}", True),
         key=hide_no_companion_widget,
         help=(
             "Drop every candidate whose score_companion is 0 (i.e. no "
@@ -1663,15 +1793,12 @@ def _render_spectrum(
             f"{plot_key}::{_ions_sig}::{_a_sig}{_b_sig}::"
             f"{_zoom_sig}::{_param_hash}"
         )
-        show_raw_graph = st.toggle(
-            "Show raw analyser spectrum",
-            value=st.session_state.get(
-                f"show_raw_graph::{key_suffix}::{label}", True
-            ),
-            key=f"show_raw_graph::{key_suffix}::{label}",
-        )
         plot_event = None
-        if show_raw_graph:
+        raw_panel_suffix = "" if key_suffix == "active" else " (comparison)"
+        with st.expander(
+            f"Raw analyser spectrum{raw_panel_suffix}",
+            expanded=False,
+        ):
             plot_event = st.plotly_chart(
                 fig,
                 use_container_width=True,
@@ -1772,16 +1899,16 @@ def _render_spectrum(
         key=f"normalize_curated::{key_suffix}::{label}",
     )
     color_mode_key = f"proportion_color_mode::{key_suffix}::{label}"
-    st.session_state.setdefault(color_mode_key, "gradient")
+    st.session_state.setdefault(color_mode_key, "distinct")
     color_col, base_color_col = st.columns(2)
     with color_col:
         proportion_color_mode = st.selectbox(
             "Proportion color style",
-            options=["gradient", "distinct"],
+            options=["distinct", "gradient"],
             format_func=lambda mode: (
-                "Single-color concentration (default)"
-                if mode == "gradient"
-                else "Distinct colors by GalNAc count"
+                "Distinct colors by GalNAc count (default)"
+                if mode == "distinct"
+                else "Single-color concentration"
             ),
             key=color_mode_key,
         )
@@ -1816,14 +1943,11 @@ def _render_spectrum(
     characteristic_fig = _characteristic_peaks_plot(
         display_df, new_name, normalize=normalize_curated
     )
-    show_characteristic_graph = st.toggle(
-        "Show characteristic sugar peaks",
-        value=st.session_state.get(
-            f"show_characteristic_graph::{key_suffix}::{label}", True
-        ),
-        key=f"show_characteristic_graph::{key_suffix}::{label}",
-    )
-    if show_characteristic_graph:
+    curated_panel_suffix = "" if key_suffix == "active" else " (comparison)"
+    with st.expander(
+        f"Characteristic sugar peaks{curated_panel_suffix}",
+        expanded=False,
+    ):
         st.plotly_chart(
             characteristic_fig,
             use_container_width=True,
@@ -1849,14 +1973,10 @@ def _render_spectrum(
         base_color=proportion_base_color,
         distinct_colors=distinct_galnac_colors,
     )
-    show_proportion_graph = st.toggle(
-        "Show composition proportions",
-        value=st.session_state.get(
-            f"show_proportion_graph::{key_suffix}::{label}", True
-        ),
-        key=f"show_proportion_graph::{key_suffix}::{label}",
-    )
-    if show_proportion_graph:
+    with st.expander(
+        f"Composition proportions{curated_panel_suffix}",
+        expanded=False,
+    ):
         st.plotly_chart(
             proportion_fig,
             use_container_width=True,
@@ -2135,13 +2255,13 @@ def main() -> None:
     st.title("MS Analyzer")
 
     # ---- Manual m/z entry (first page, works without any file upload) --
-    st.markdown("### Manual m/z list")
-    st.markdown(
+    manual_panel = st.expander("Manual m/z list", expanded=False)
+    manual_panel.markdown(
         "Type m/z values (one per line) and click **Find composition**. "
         "The app tries every GalNAc / Gal / Na+, K+ combo, shows the "
         "closest match per value."
     )
-    _check_mz_text = st.text_area(
+    _check_mz_text = manual_panel.text_area(
         "Measured m/z values",
         value=st.session_state.get("adhoc_check_mz", ""),
         key="adhoc_check_mz_widget",
@@ -2154,7 +2274,7 @@ def main() -> None:
             "1095.281"
         ),
     )
-    if st.button("Find composition", key="analyse_manual_list", type="primary"):
+    if manual_panel.button("Find composition", key="analyse_manual_list", type="primary"):
         # Parse the m/z values.
         raw_tokens = re.split(r"[\s,;]+", _check_mz_text)
         _measured_mzs: list[float] = []
@@ -2165,9 +2285,9 @@ def main() -> None:
             try:
                 _measured_mzs.append(float(tok))
             except ValueError:
-                st.warning(f"Ignoring non-numeric value: {tok!r}")
+                manual_panel.warning(f"Ignoring non-numeric value: {tok!r}")
         if not _measured_mzs:
-            st.error("Enter at least one numeric m/z value first.")
+            manual_panel.error("Enter at least one numeric m/z value first.")
             st.stop()
         st.session_state["adhoc_check_mz"] = _check_mz_text
         st.session_state["adhoc_check_last_result"] = {
@@ -2177,8 +2297,8 @@ def main() -> None:
     # Render the result table whenever we have a stored result.
     _check_result = st.session_state.get("adhoc_check_last_result")
     if _check_result is not None and _check_result.get("measured_mzs"):
-        st.markdown("---")
-        st.markdown("**Composition check result**")
+        manual_panel.markdown("---")
+        manual_panel.markdown("**Composition check result**")
         _measured_mzs = _check_result["measured_mzs"]
         # Build a fake spectrum so the screener can look for companions.
         _spectrum_peaks = dedup_peaks(
@@ -2323,7 +2443,7 @@ def main() -> None:
                         if _comp.endswith(f" + {_ion}"):
                             _ion_counts[_ion] += 1
                             break
-            st.markdown(
+            manual_panel.markdown(
                 f"**{_n_total}** total candidates across "
                 f"**{len(_measured_mzs)}** measured value(s) - "
                 f"**{_n_hits}** survived the screener "
@@ -2335,7 +2455,7 @@ def main() -> None:
                 f"observed), **YELLOW** (some signal), **RED** (off by "
                 f"more than 0.5 Da in m/z), or **PURGE** (|m/z diff| > 0.5 Da)."
             )
-            st.dataframe(
+            manual_panel.dataframe(
                 _df,
                 use_container_width=True,
                 hide_index=True,
