@@ -193,31 +193,21 @@ def _compose_graph_grid_png(
     payloads: Iterable[bytes],
     title: str,
 ) -> bytes:
-    """Combine one to four prepared graph PNGs into one titled grid PNG.
+    """Combine prepared graph PNGs into one titled, near-square grid PNG.
 
-    Two graphs are placed side by side. Three or four graphs use a two-column
-    grid. Images are scaled down, never up, and centered in equal-size cells so
-    a mixed selection of spectrum and composition plots stays aligned.
+    Images are scaled down, never up, and centered in equal-size cells so a
+    mixed selection of spectrum and composition plots stays aligned.
     """
     source_payloads = [bytes(payload) for payload in payloads if payload]
     if not source_payloads:
         return b""
-    if len(source_payloads) > 4:
-        raise ValueError("A combined graph PNG supports at most four graphs.")
 
-    images: list[Image.Image] = []
-    for payload in source_payloads:
-        with Image.open(io.BytesIO(payload)) as source:
-            image = source.convert("RGB")
-            image.thumbnail((1200, 750), Image.Resampling.LANCZOS)
-            images.append(image.copy())
-
-    columns = 1 if len(images) == 1 else 2
-    rows = math.ceil(len(images) / columns)
-    cell_width = max(image.width for image in images)
-    cell_height = max(image.height for image in images)
+    columns = math.ceil(math.sqrt(len(source_payloads)))
+    rows = math.ceil(len(source_payloads) / columns)
     padding = 24
-    gap = 24
+    desired_gap = 24
+    max_canvas_width = 6000
+    max_canvas_height = 6000
     title_text = title.strip() or "Combined MS analyser graphs"
     try:
         title_font = ImageFont.truetype("arial.ttf", 46)
@@ -229,8 +219,71 @@ def _compose_graph_grid_png(
     title_box = measure_draw.textbbox((0, 0), title_text, font=title_font)
     title_height = max(title_box[3] - title_box[1], 46)
     title_area = title_height + padding * 2
-    canvas_width = padding * 2 + columns * cell_width + (columns - 1) * gap
-    canvas_height = title_area + padding + rows * cell_height + (rows - 1) * gap + padding
+
+    horizontal_gap = min(
+        desired_gap,
+        max(
+            0,
+            (max_canvas_width - padding * 2 - columns) // max(columns - 1, 1),
+        ),
+    )
+    vertical_gap = min(
+        desired_gap,
+        max(
+            0,
+            (
+                max_canvas_height
+                - title_area
+                - padding * 2
+                - rows
+            )
+            // max(rows - 1, 1),
+        ),
+    )
+    max_cell_width = max(
+        1,
+        (
+            max_canvas_width
+            - padding * 2
+            - (columns - 1) * horizontal_gap
+        )
+        // columns,
+    )
+    max_cell_height = max(
+        1,
+        (
+            max_canvas_height
+            - title_area
+            - padding * 2
+            - (rows - 1) * vertical_gap
+        )
+        // rows,
+    )
+
+    images: list[Image.Image] = []
+    for payload in source_payloads:
+        with Image.open(io.BytesIO(payload)) as source:
+            image = source.convert("RGB")
+            image.thumbnail(
+                (min(1200, max_cell_width), min(750, max_cell_height)),
+                Image.Resampling.LANCZOS,
+            )
+            images.append(image.copy())
+
+    cell_width = max(image.width for image in images)
+    cell_height = max(image.height for image in images)
+    canvas_width = (
+        padding * 2
+        + columns * cell_width
+        + (columns - 1) * horizontal_gap
+    )
+    canvas_height = (
+        title_area
+        + padding
+        + rows * cell_height
+        + (rows - 1) * vertical_gap
+        + padding
+    )
     canvas = Image.new("RGB", (canvas_width, canvas_height), "white")
     draw = ImageDraw.Draw(canvas)
     title_width = title_box[2] - title_box[0]
@@ -244,8 +297,8 @@ def _compose_graph_grid_png(
     grid_top = title_area + padding
     for index, image in enumerate(images):
         row, column = divmod(index, columns)
-        cell_x = padding + column * (cell_width + gap)
-        cell_y = grid_top + row * (cell_height + gap)
+        cell_x = padding + column * (cell_width + horizontal_gap)
+        cell_y = grid_top + row * (cell_height + vertical_gap)
         image_x = cell_x + (cell_width - image.width) // 2
         image_y = cell_y + (cell_height - image.height) // 2
         canvas.paste(image, (image_x, image_y))
@@ -354,6 +407,9 @@ def _download_buttons(
                     "payload": payload,
                 }
         st.session_state["global_prepared_graph_cart"] = cart
+        for state_key in list(st.session_state):
+            if str(state_key).startswith("composite_graph_preview::"):
+                st.session_state.pop(state_key, None)
 
     if prepared is None:
         st.caption(
@@ -417,8 +473,8 @@ def _download_buttons(
         expanded=False,
     ):
         st.caption(
-            "Pick up to four prepared graphs. Two are placed side by side; "
-            "three or four use a two-column grid. The preview is the exact PNG download."
+            "Pick any number of prepared graphs. They are arranged in an automatic grid. "
+            "Generate the preview when ready; the preview is the exact PNG download."
         )
         composite_selection_key = f"composite_graph_selection::{dataset_id}"
         if composite_selection_key in st.session_state:
@@ -426,16 +482,15 @@ def _download_buttons(
                 key
                 for key in st.session_state[composite_selection_key]
                 if key in cart
-            ][:4]
+            ]
         composite_keys = st.multiselect(
             "Graphs to merge",
             options=list(cart),
-            default=list(cart)[:4],
+            default=list(cart),
             format_func=lambda key: (
                 f"{cart[key]['dataset_name']} - "
                 f"{graph_definitions.get(cart[key]['kind'], {}).get('label', cart[key]['kind'])}"
             ),
-            max_selections=4,
             key=composite_selection_key,
         )
         composite_title = st.text_input(
@@ -443,30 +498,57 @@ def _download_buttons(
             value="Combined MS analyser graphs",
             key=f"composite_graph_title::{dataset_id}",
         )
-        if composite_keys:
+        composite_signature = hashlib.sha256(
+            repr((tuple(composite_keys), composite_title)).encode("utf-8")
+        ).hexdigest()[:12]
+        composite_preview_key = f"composite_graph_preview::{dataset_id}::{key_suffix}"
+        generate_composite = st.button(
+            "Generate or update preview",
+            key=f"generate_composite_graph::{dataset_id}::{key_suffix}",
+            type="primary",
+            use_container_width=True,
+            disabled=not composite_keys,
+        )
+        if generate_composite:
             composite_png = _compose_graph_grid_png(
                 [cart[key]["payload"] for key in composite_keys],
                 composite_title,
             )
+            st.session_state[composite_preview_key] = {
+                "signature": composite_signature,
+                "payload": composite_png,
+                "graph_count": len(composite_keys),
+                "title": composite_title,
+            }
+
+        composite_preview = st.session_state.get(composite_preview_key)
+        if (
+            isinstance(composite_preview, dict)
+            and composite_preview.get("signature") == composite_signature
+        ):
+            composite_png = bytes(composite_preview.get("payload", b""))
             st.image(
                 composite_png,
-                caption=f"Preview: {len(composite_keys)} graph(s) in one PNG",
-                width="stretch",
+                caption=f"Preview: {composite_preview['graph_count']} graph(s) in one PNG",
+                use_container_width=True,
             )
-            composite_signature = hashlib.sha256(
-                "|".join(composite_keys + [composite_title]).encode("utf-8")
-            ).hexdigest()[:12]
             st.download_button(
                 "Download combined PNG",
                 data=composite_png,
-                file_name=f"{_safe_filename(composite_title or 'combined_graphs')}.png",
+                file_name=(
+                    f"{_safe_filename(str(composite_preview.get('title') or 'combined_graphs'))}.png"
+                ),
                 mime="image/png",
                 key=f"download_composite_png::{dataset_id}::{composite_signature}",
                 type="primary",
                 use_container_width=True,
             )
+        elif composite_keys and isinstance(composite_preview, dict):
+            st.info("The selection or title changed. Generate the preview again to update it.")
+        elif composite_keys:
+            st.info("Generate the preview to build the combined PNG.")
         else:
-            st.info("Select at least one prepared graph to see the combined preview.")
+            st.info("Select at least one prepared graph, then generate the preview.")
 
     remove_keys = st.multiselect(
         "Remove specific prepared files from the ZIP collection",
@@ -722,11 +804,22 @@ def _with_candidate_row_ids(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+_GALNAC_ZERO_COLOR = "#8B0000"
+_GALNAC_ONE_COLOR = "#F4A3A3"
 _COMPOSITION_COLORS = (
-    "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9",
-    "#F0E442", "#332288", "#44AA99", "#117733", "#999933", "#CC6677",
+    "#0072B2", "#009E73", "#332288", "#44AA99", "#117733", "#999933",
+    "#56B4E9", "#88CCEE", "#6A5ACD", "#777777", "#6699CC", "#228833",
 )
 _DEFAULT_GALNAC_GREEN = "#009E73"
+
+
+def _default_galnac_color(count: int) -> str:
+    """Return the fixed default color for a GalNAc count."""
+    if count == 0:
+        return _GALNAC_ZERO_COLOR
+    if count == 1:
+        return _GALNAC_ONE_COLOR
+    return _COMPOSITION_COLORS[(count - 2) % len(_COMPOSITION_COLORS)]
 
 
 def _galnac_color_map(
@@ -743,10 +836,8 @@ def _galnac_color_map(
     if mode == "distinct":
         overrides = distinct_colors or {}
         return {
-            count: overrides.get(
-                count, _COMPOSITION_COLORS[index % len(_COMPOSITION_COLORS)]
-            )
-            for index, count in enumerate(ordered)
+            count: overrides.get(count, _default_galnac_color(count))
+            for count in ordered
         }
     if not re.fullmatch(r"#[0-9A-Fa-f]{6}", base_color):
         base_color = _DEFAULT_GALNAC_GREEN
@@ -807,7 +898,7 @@ def _characteristic_peaks_plot(
             x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
         )
         fig.update_layout(
-            title=f"{label} — Characteristic Sugar Peaks",
+            title=f"{label} - Characteristic Sugar Peaks",
             template="simple_white", height=430,
         )
         return fig
@@ -861,7 +952,7 @@ def _characteristic_peaks_plot(
         padding = (mz_max - mz_min) * 0.015
         mz_min, mz_max = mz_min - padding, mz_max + padding
     fig.update_layout(
-        title=f"{label} — Characteristic Sugar Peaks",
+        title=f"{label} - Characteristic Sugar Peaks",
         template="simple_white",
         height=480,
         dragmode="zoom",
@@ -894,7 +985,7 @@ def _composition_proportion_plot(
             x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
         )
         fig.update_layout(
-            title=f"{label} — Composition Proportions",
+            title=f"{label} - Composition Proportions",
             template="simple_white", height=430,
         )
         return fig
@@ -910,7 +1001,7 @@ def _composition_proportion_plot(
             x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
         )
         fig.update_layout(
-            title=f"{label} — Composition Proportions",
+            title=f"{label} - Composition Proportions",
             template="simple_white", height=430,
         )
         return fig
@@ -983,7 +1074,7 @@ def _composition_proportion_plot(
     ]
     max_share = max(float(dp_totals.get(dp, 0)) / grand_total * 100 for dp in dps)
     fig.update_layout(
-        title=f"{label} — Composition Proportions",
+        title=f"{label} - Composition Proportions",
         template="simple_white",
         height=480,
         barmode="stack",
@@ -1385,6 +1476,62 @@ def _render_spectrum(
     rename_default = st.session_state.get(rename_widget, label)
     new_name = st.text_input("Sample name", value=rename_default, key=rename_widget)
 
+    graph_panel_suffix = "" if key_suffix == "active" else " (comparison)"
+    graph_title_keys = {
+        "raw": f"graph_title::raw::{key_suffix}::{label}",
+        "characteristic": f"graph_title::characteristic::{key_suffix}::{label}",
+        "proportions": f"graph_title::proportions::{key_suffix}::{label}",
+    }
+    graph_title_source_key = f"graph_title_sample_source::{key_suffix}::{label}"
+    previous_sample_name = st.session_state.get(graph_title_source_key)
+    current_title_defaults = {
+        "raw": new_name,
+        "characteristic": f"{new_name} - Characteristic Sugar Peaks",
+        "proportions": f"{new_name} - Composition Proportions",
+    }
+    if previous_sample_name is None:
+        for graph_kind, title_key in graph_title_keys.items():
+            st.session_state.setdefault(title_key, current_title_defaults[graph_kind])
+    elif previous_sample_name != new_name:
+        previous_title_defaults = {
+            "raw": previous_sample_name,
+            "characteristic": f"{previous_sample_name} - Characteristic Sugar Peaks",
+            "proportions": f"{previous_sample_name} - Composition Proportions",
+        }
+        for graph_kind, title_key in graph_title_keys.items():
+            if st.session_state.get(title_key) == previous_title_defaults[graph_kind]:
+                st.session_state[title_key] = current_title_defaults[graph_kind]
+    st.session_state[graph_title_source_key] = new_name
+
+    with st.expander("Rename graph sections and titles", expanded=False):
+        raw_section_name = st.text_input(
+            "Raw spectrum section header",
+            value=f"Raw analyser spectrum{graph_panel_suffix}",
+            key=f"graph_section_name::raw::{key_suffix}::{label}",
+        )
+        raw_graph_title = st.text_input(
+            "Raw spectrum graph title",
+            key=graph_title_keys["raw"],
+        )
+        characteristic_section_name = st.text_input(
+            "Characteristic peaks section header",
+            value=f"Characteristic sugar peaks{graph_panel_suffix}",
+            key=f"graph_section_name::characteristic::{key_suffix}::{label}",
+        )
+        characteristic_graph_title = st.text_input(
+            "Characteristic peaks graph title",
+            key=graph_title_keys["characteristic"],
+        )
+        proportion_section_name = st.text_input(
+            "Composition proportions section header",
+            value=f"Composition proportions{graph_panel_suffix}",
+            key=f"graph_section_name::proportions::{key_suffix}::{label}",
+        )
+        proportion_graph_title = st.text_input(
+            "Composition proportions graph title",
+            key=graph_title_keys["proportions"],
+        )
+
     cols = st.columns(4)
     # Persist the plot style across reruns via session_state. Without
     # this the Dots / Bars buttons silently revert to "sticks" on
@@ -1471,7 +1618,7 @@ def _render_spectrum(
             for p in _peaks_in_range[:200]
         }
         st.caption(
-            "Type peak m/z values (e.g. 1177.42, 1460.36) — "
+            "Type peak m/z values (e.g. 1177.42, 1460.36): "
             "clear the field to reset."
         )
         with st.form(key=f"measure_form::{key_suffix}::{label}", clear_on_submit=False):
@@ -1480,7 +1627,7 @@ def _render_spectrum(
             with _m_cols[0]:
                 _a_pick = st.selectbox(
                     "Point A (peak)",
-                    options=["— type below —"] + _peak_labels,
+                    options=["-- type below --"] + _peak_labels,
                     index=0,
                     key=f"measure_a_pick::{key_suffix}::{label}",
                 )
@@ -1495,7 +1642,7 @@ def _render_spectrum(
             with _m_cols[1]:
                 _b_pick = st.selectbox(
                     "Point B (peak)",
-                    options=["— type below —"] + _peak_labels,
+                    options=["-- type below --"] + _peak_labels,
                     index=0,
                     key=f"measure_b_pick::{key_suffix}::{label}",
                 )
@@ -1521,10 +1668,10 @@ def _render_spectrum(
             if _submitted:
                 # Pick from the selectbox if the user changed it;
                 # otherwise use the typed value.
-                _a_val = _peak_lookup.get(_a_pick) if _a_pick != "— type below —" else None
+                _a_val = _peak_lookup.get(_a_pick) if _a_pick != "-- type below --" else None
                 if _a_val is None and _a_typed > 0:
                     _a_val = float(_a_typed)
-                _b_val = _peak_lookup.get(_b_pick) if _b_pick != "— type below —" else None
+                _b_val = _peak_lookup.get(_b_pick) if _b_pick != "-- type below --" else None
                 if _b_val is None and _b_typed > 0:
                     _b_val = float(_b_typed)
                 st.session_state[measure_state_key] = {"A": _a_val, "B": _b_val}
@@ -1780,6 +1927,7 @@ def _render_spectrum(
                 st.session_state.get("sidebar_min_intensity", 0.0)
             ),
         )
+        fig.update_layout(title=raw_graph_title)
         # Force a fresh widget slot whenever the ion-visibility state
         # or the measure state changes. Without this, st.plotly_chart
         # reuses the cached figure from the previous render and
@@ -1794,9 +1942,8 @@ def _render_spectrum(
             f"{_zoom_sig}::{_param_hash}"
         )
         plot_event = None
-        raw_panel_suffix = "" if key_suffix == "active" else " (comparison)"
         with st.expander(
-            f"Raw analyser spectrum{raw_panel_suffix}",
+            raw_section_name,
             expanded=False,
         ):
             plot_event = st.plotly_chart(
@@ -1930,11 +2077,11 @@ def _render_spectrum(
     distinct_galnac_colors: dict[int, str] = {}
     if proportion_color_mode == "distinct" and galnac_counts:
         with st.popover("Edit distinct GalNAc colors"):
-            for index, count in enumerate(galnac_counts):
-                picker_key = f"galnac_color::{key_suffix}::{label}::{count}"
+            for count in galnac_counts:
+                picker_key = f"galnac_color_v2::{key_suffix}::{label}::{count}"
                 st.session_state.setdefault(
                     picker_key,
-                    _COMPOSITION_COLORS[index % len(_COMPOSITION_COLORS)],
+                    _default_galnac_color(count),
                 )
                 distinct_galnac_colors[count] = st.color_picker(
                     f"{count} GalNAc",
@@ -1943,9 +2090,9 @@ def _render_spectrum(
     characteristic_fig = _characteristic_peaks_plot(
         display_df, new_name, normalize=normalize_curated
     )
-    curated_panel_suffix = "" if key_suffix == "active" else " (comparison)"
+    characteristic_fig.update_layout(title=characteristic_graph_title)
     with st.expander(
-        f"Characteristic sugar peaks{curated_panel_suffix}",
+        characteristic_section_name,
         expanded=False,
     ):
         st.plotly_chart(
@@ -1973,8 +2120,9 @@ def _render_spectrum(
         base_color=proportion_base_color,
         distinct_colors=distinct_galnac_colors,
     )
+    proportion_fig.update_layout(title=proportion_graph_title)
     with st.expander(
-        f"Composition proportions{curated_panel_suffix}",
+        proportion_section_name,
         expanded=False,
     ):
         st.plotly_chart(
@@ -2094,6 +2242,9 @@ def _render_spectrum(
                 style,
                 str(auto_zoom_detail),
                 str(normalize_curated),
+                raw_graph_title,
+                characteristic_graph_title,
+                proportion_graph_title,
                 proportion_color_mode,
                 proportion_base_color,
                 ",".join(
@@ -2149,6 +2300,10 @@ _PREFIXES = (
     "proportion_color_mode::",
     "proportion_base_color::",
     "galnac_color::",
+    "galnac_color_v2::",
+    "graph_section_name::",
+    "graph_title::",
+    "graph_title_sample_source::",
     "show_raw_graph::",
     "show_characteristic_graph::",
     "show_proportion_graph::",
@@ -2161,6 +2316,24 @@ _PREFIXES = (
     "hide_reds::",
     "hide_low_sn::",
 )
+
+
+def _label_from_scoped_state_key(key: str, prefix: str) -> str:
+    """Extract the dataset label from a parser-scoped session-state key."""
+    tail = key[len(prefix):]
+    if prefix in {"graph_section_name::", "graph_title::"}:
+        parts = tail.split("::", 2)
+        return parts[2] if len(parts) == 3 else tail
+    if prefix == "graph_title_sample_source::":
+        parts = tail.split("::", 1)
+        return parts[1] if len(parts) == 2 else tail
+    if prefix in {"galnac_color::", "galnac_color_v2::"}:
+        parts = tail.split("::", 1)
+        label_and_count = parts[1] if len(parts) == 2 else tail
+        return label_and_count.rsplit("::", 1)[0]
+    if "::" in tail and " :: " not in tail:
+        return tail.split("::", 1)[1]
+    return tail
 
 
 def _file_fingerprint(up: Any) -> str:
@@ -2197,11 +2370,7 @@ def _wipe_parser_scoped_state(vanished_labels: set[str] | None = None) -> None:
         for k in list(st.session_state.keys()):
             for prefix in _PREFIXES:
                 if k.startswith(prefix):
-                    tail = k[len(prefix):]
-                    if "::" in tail and " :: " not in tail:
-                        label_part = tail.split("::", 1)[1]
-                    else:
-                        label_part = tail
+                    label_part = _label_from_scoped_state_key(k, prefix)
                     if label_part in vanished_labels:
                         keys_to_drop.append(k)
                     break

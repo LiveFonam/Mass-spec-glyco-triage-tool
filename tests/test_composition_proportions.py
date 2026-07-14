@@ -83,9 +83,21 @@ def test_proportion_labels_stay_horizontal_and_shrink_for_small_segments() -> No
 
 
 def test_default_galnac_colors_are_distinct() -> None:
-    colors = _galnac_color_map([1, 2, 3])
+    colors = _galnac_color_map([0, 1, 2, 3])
 
-    assert colors == {1: "#0072B2", 2: "#D55E00", 3: "#009E73"}
+    assert colors == {
+        0: "#8B0000",
+        1: "#F4A3A3",
+        2: "#0072B2",
+        3: "#009E73",
+    }
+
+
+def test_default_galnac_colors_do_not_shift_when_counts_are_missing() -> None:
+    assert _galnac_color_map([1, 3]) == {
+        1: "#F4A3A3",
+        3: "#009E73",
+    }
 
 
 def test_gradient_galnac_colors_use_increasing_concentration() -> None:
@@ -213,6 +225,10 @@ def test_composite_png_uses_two_rows_for_three_or_four_graphs() -> None:
         assert four_image.size == three_image.size
 
 
-def test_composite_png_rejects_more_than_four_graphs() -> None:
-    with pytest.raises(ValueError, match="at most four"):
-        _compose_graph_grid_png([_solid_png("red")] * 5, "Too many")
+def test_composite_png_supports_more_than_four_graphs() -> None:
+    payload = _compose_graph_grid_png([_solid_png("blue")] * 7, "Seven graphs")
+
+    with Image.open(io.BytesIO(payload)) as image:
+        assert image.format == "PNG"
+        assert image.width >= 400
+        assert image.height >= 200
