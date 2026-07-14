@@ -2,10 +2,12 @@ import pandas as pd
 import pytest
 import io
 import zipfile
+from PIL import Image
 
 from app import (
     _characteristic_peaks_plot,
     _composition_proportion_plot,
+    _compose_graph_grid_png,
     _curated_peak_rows,
     _graph_cart_zip_bytes,
     _graph_export_filename,
@@ -80,8 +82,14 @@ def test_proportion_labels_stay_horizontal_and_shrink_for_small_segments() -> No
     assert figure.layout.uniformtext.minsize == 6
 
 
-def test_default_galnac_colors_use_increasing_green_concentration() -> None:
+def test_default_galnac_colors_are_distinct() -> None:
     colors = _galnac_color_map([1, 2, 3])
+
+    assert colors == {1: "#0072B2", 2: "#D55E00", 3: "#009E73"}
+
+
+def test_gradient_galnac_colors_use_increasing_concentration() -> None:
+    colors = _galnac_color_map([1, 2, 3], mode="gradient")
 
     assert colors[3] == "#009E73"
     brightness = {
@@ -176,3 +184,35 @@ def test_global_graph_cart_zips_multiple_datasets_together() -> None:
             for dataset_name in ("Dataset 1", "Dataset 2")
             for kind in ("spectrum", "peaks", "proportions")
         )
+
+
+def _solid_png(color: str, size: tuple[int, int] = (400, 200)) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_composite_png_puts_two_graphs_side_by_side_with_a_title() -> None:
+    payload = _compose_graph_grid_png(
+        [_solid_png("red"), _solid_png("blue")],
+        "Shared title",
+    )
+
+    with Image.open(io.BytesIO(payload)) as image:
+        assert image.format == "PNG"
+        assert image.width > image.height
+        assert image.width >= 800
+
+
+def test_composite_png_uses_two_rows_for_three_or_four_graphs() -> None:
+    three = _compose_graph_grid_png([_solid_png("red")] * 3, "Three")
+    four = _compose_graph_grid_png([_solid_png("blue")] * 4, "Four")
+
+    with Image.open(io.BytesIO(three)) as three_image, Image.open(io.BytesIO(four)) as four_image:
+        assert three_image.height > 400
+        assert four_image.size == three_image.size
+
+
+def test_composite_png_rejects_more_than_four_graphs() -> None:
+    with pytest.raises(ValueError, match="at most four"):
+        _compose_graph_grid_png([_solid_png("red")] * 5, "Too many")
