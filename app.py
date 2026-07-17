@@ -1436,6 +1436,166 @@ def _spectrum_plot(
 # Per-spectrum render
 # ---------------------------------------------------------------------------
 
+def _peak_entries_to_peaks(rows: pd.DataFrame) -> tuple[list[Peak], list[str]]:
+    """Validate peak-entry table rows and convert complete rows to Peaks."""
+    additions: list[Peak] = []
+    errors: list[str] = []
+
+    for row_number, (_, row) in enumerate(rows.iterrows(), start=1):
+        mz_raw = row.get("mz")
+        intensity_raw = row.get("intensity")
+        mz_missing = mz_raw is None or bool(pd.isna(mz_raw))
+        intensity_missing = intensity_raw is None or bool(pd.isna(intensity_raw))
+
+        if mz_missing and intensity_missing:
+            continue
+        if mz_missing or intensity_missing:
+            errors.append(f"Row {row_number}: enter both m/z and intensity.")
+            continue
+
+        try:
+            mz = float(mz_raw)
+            intensity = float(intensity_raw)
+        except (TypeError, ValueError):
+            errors.append(f"Row {row_number}: m/z and intensity must be numeric.")
+            continue
+
+        if not math.isfinite(mz) or mz <= 0:
+            errors.append(f"Row {row_number}: m/z must be a positive finite number.")
+        elif not math.isfinite(intensity) or intensity < 0:
+            errors.append(
+                f"Row {row_number}: intensity must be a non-negative finite number."
+            )
+        else:
+            additions.append(Peak(mz=mz, intensity=intensity))
+
+    return additions, errors
+
+
+def _spectrum_with_added_peaks(
+    spectrum: Spectrum,
+    additions: Iterable[Peak],
+) -> Spectrum:
+    """Return a spectrum containing its original peaks plus new peak rows."""
+    return Spectrum(
+        peaks=[*spectrum.peaks, *additions],
+        source=spectrum.source,
+        mz_hi=spectrum.mz_hi,
+    )
+
+
+def _is_spectrum_analysis_key(key: str, label: str) -> bool:
+    """Return whether a session-state key caches analysis for one spectrum."""
+    for prefix in (f"candidates::{label}", f"spectrum::{label}"):
+        if key == prefix or key.startswith(prefix + "::"):
+            return True
+
+    scoped_prefixes = (
+        f"removed_candidates::active::{label}::",
+        f"removed_candidates::compare::{label}::",
+        f"table_active_{label}_",
+        f"table_compare_{label}_",
+    )
+    if key.startswith(scoped_prefixes):
+        return True
+
+    return key in {
+        f"prepared_graph_downloads::active::{label}",
+        f"prepared_graph_downloads::compare::{label}",
+    }
+
+
+def _invalidate_spectrum_analysis(label: str) -> None:
+    """Clear derived analysis after the raw peak list changes."""
+    for key in list(st.session_state):
+        if _is_spectrum_analysis_key(str(key), label):
+            st.session_state.pop(key, None)
+
+    cart = dict(st.session_state.get("global_prepared_graph_cart", {}))
+    dataset_ids = {f"active::{label}", f"compare::{label}"}
+    filtered_cart = {
+        key: entry
+        for key, entry in cart.items()
+        if entry.get("dataset_id") not in dataset_ids
+    }
+    if filtered_cart != cart:
+        st.session_state["global_prepared_graph_cart"] = filtered_cart
+        for key in list(st.session_state):
+            if str(key).startswith("composite_graph_preview::"):
+                st.session_state.pop(key, None)
+
+
+def _render_peak_entry_editor(label: str, spectrum: Spectrum) -> None:
+    """Render a two-column table that appends peaks to the active spectrum."""
+    notice_key = f"add_peaks_notice::{label}"
+    notice = st.session_state.pop(notice_key, None)
+    editor_version_key = f"add_peaks_editor_version::{label}"
+    editor_version = int(st.session_state.get(editor_version_key, 0))
+
+    with st.expander(
+        "Add peaks to this spectrum (m/z and intensity)",
+        expanded=bool(notice),
+    ):
+        if notice:
+            st.success(str(notice))
+        st.caption(
+            "Add one or more rows with both values, then apply them. "
+            "The analyser will recalculate the candidate table and all graphs."
+        )
+        entry_rows = pd.DataFrame(
+            {
+                "mz": pd.Series([None], dtype="Float64"),
+                "intensity": pd.Series([None], dtype="Float64"),
+            }
+        )
+        edited_rows = st.data_editor(
+            entry_rows,
+            num_rows="dynamic",
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "mz": st.column_config.NumberColumn(
+                    "m/z",
+                    min_value=0.0,
+                    format="%.4f",
+                    required=True,
+                ),
+                "intensity": st.column_config.NumberColumn(
+                    "intensity",
+                    min_value=0.0,
+                    format="%.2f",
+                    required=True,
+                ),
+            },
+            key=f"add_peaks_editor::{label}::{editor_version}",
+        )
+        if st.button(
+            "Add peaks and reanalyse",
+            key=f"add_peaks_apply::{label}::{editor_version}",
+            type="primary",
+        ):
+            additions, errors = _peak_entries_to_peaks(edited_rows)
+            if errors:
+                st.error("\n".join(errors))
+            elif not additions:
+                st.warning("Enter at least one complete m/z and intensity row.")
+            else:
+                parsed = dict(st.session_state.get("parsed", {}))
+                base_spectrum = parsed.get(label, spectrum)
+                parsed[label] = _spectrum_with_added_peaks(
+                    base_spectrum,
+                    additions,
+                )
+                st.session_state["parsed"] = parsed
+                _invalidate_spectrum_analysis(label)
+                st.session_state[editor_version_key] = editor_version + 1
+                noun = "peak" if len(additions) == 1 else "peaks"
+                st.session_state[notice_key] = (
+                    f"Added {len(additions)} {noun}. Analysis and graphs were updated."
+                )
+                st.rerun()
+
+
 def _render_spectrum(
     label: str,
     *,
@@ -1475,6 +1635,9 @@ def _render_spectrum(
     rename_widget = f"spec_rename::{key_suffix}::{label}"
     rename_default = st.session_state.get(rename_widget, label)
     new_name = st.text_input("Sample name", value=rename_default, key=rename_widget)
+
+    if key_suffix == "active":
+        _render_peak_entry_editor(label, sp)
 
     graph_panel_suffix = "" if key_suffix == "active" else " (comparison)"
     graph_title_keys = {
@@ -2315,6 +2478,10 @@ _PREFIXES = (
     "plot_label_fields::",
     "hide_reds::",
     "hide_low_sn::",
+    "add_peaks_notice::",
+    "add_peaks_editor_version::",
+    "add_peaks_editor::",
+    "add_peaks_apply::",
 )
 
 
@@ -2331,6 +2498,8 @@ def _label_from_scoped_state_key(key: str, prefix: str) -> str:
         parts = tail.split("::", 1)
         label_and_count = parts[1] if len(parts) == 2 else tail
         return label_and_count.rsplit("::", 1)[0]
+    if prefix in {"add_peaks_editor::", "add_peaks_apply::"}:
+        return tail.rsplit("::", 1)[0]
     if "::" in tail and " :: " not in tail:
         return tail.split("::", 1)[1]
     return tail
