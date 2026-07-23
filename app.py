@@ -839,6 +839,59 @@ def _with_candidate_row_ids(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def _candidate_removal_state_key(label: str, param_hash: str) -> str:
+    """Return the shared row-removal key for one analyzed dataset."""
+    return f"removed_candidates::dataset::{label}::{param_hash}"
+
+
+def _merge_candidate_removal_ids(*groups: Iterable[str]) -> list[str]:
+    """Combine removal lists while preserving removal order and uniqueness."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for row_id in group:
+            normalized = str(row_id)
+            if normalized not in seen:
+                seen.add(normalized)
+                merged.append(normalized)
+    return merged
+
+
+def _candidate_removal_revision(removed_ids: Iterable[str]) -> str:
+    """Return a stable editor revision for the exact removed-row sequence."""
+    payload = "\0".join(str(row_id) for row_id in removed_ids)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _record_candidate_editor_removals(
+    editor_key: str,
+    removed_key: str,
+    visible_row_ids: list[str],
+) -> None:
+    """Commit checked rows before Streamlit redraws any candidate table."""
+    editor_state = st.session_state.get(editor_key, {})
+    edited_rows = (
+        editor_state.get("edited_rows", {})
+        if isinstance(editor_state, dict)
+        else {}
+    )
+    newly_removed: list[str] = []
+    for row_position, changes in edited_rows.items():
+        if not isinstance(changes, dict) or not changes.get("_remove", False):
+            continue
+        try:
+            position = int(row_position)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= position < len(visible_row_ids):
+            newly_removed.append(visible_row_ids[position])
+
+    existing = list(st.session_state.get(removed_key, []) or [])
+    merged = _merge_candidate_removal_ids(existing, newly_removed)
+    if merged != existing:
+        st.session_state[removed_key] = merged
+
+
 _GALNAC_ZERO_COLOR = "#8B0000"
 _GALNAC_ONE_COLOR = "#F4A3A3"
 _COMPOSITION_COLORS = (
@@ -1548,6 +1601,7 @@ def _is_spectrum_analysis_key(key: str, label: str) -> bool:
             return True
 
     scoped_prefixes = (
+        f"removed_candidates::dataset::{label}::",
         f"removed_candidates::active::{label}::",
         f"removed_candidates::compare::{label}::",
         f"table_active_{label}_",
@@ -1719,9 +1773,20 @@ def _render_spectrum(
         )
     )
     candidates_with_ids = _with_candidate_row_ids(candidates)
-    removed_key = f"removed_candidates::{key_suffix}::{label}::{_param_hash}"
-    removed_ids = list(st.session_state.get(removed_key, []))
+    removed_key = _candidate_removal_state_key(label, _param_hash)
+    legacy_removed_keys = (
+        f"removed_candidates::active::{label}::{_param_hash}",
+        f"removed_candidates::compare::{label}::{_param_hash}",
+    )
+    removed_ids = _merge_candidate_removal_ids(
+        st.session_state.get(removed_key, []) or [],
+        *(st.session_state.get(key, []) or [] for key in legacy_removed_keys),
+    )
+    st.session_state[removed_key] = removed_ids
+    for legacy_key in legacy_removed_keys:
+        st.session_state.pop(legacy_key, None)
     removed_set = set(removed_ids)
+    removed_revision = _candidate_removal_revision(removed_ids)
     retained_candidates = candidates_with_ids[
         ~candidates_with_ids["_candidate_row_id"].isin(removed_set)
     ].copy()
@@ -2360,7 +2425,7 @@ def _render_spectrum(
         st.plotly_chart(
             characteristic_fig,
             use_container_width=True,
-            key=f"characteristic::{key_suffix}::{label}::{_param_hash}::{len(removed_ids)}::{normalize_curated}",
+            key=f"characteristic::{key_suffix}::{label}::{_param_hash}::{removed_revision}::{normalize_curated}",
             config={
                 "displayModeBar": True,
                 "displaylogo": False,
@@ -2391,7 +2456,7 @@ def _render_spectrum(
         st.plotly_chart(
             proportion_fig,
             use_container_width=True,
-            key=f"proportions::{key_suffix}::{label}::{_param_hash}::{len(removed_ids)}",
+            key=f"proportions::{key_suffix}::{label}::{_param_hash}::{removed_revision}",
             config={
                 "displayModeBar": True,
                 "displaylogo": False,
@@ -2439,7 +2504,11 @@ def _render_spectrum(
             editor_styled = editor_styled.apply(_highlight_da, subset=["mz_diff"])
         if "tier" in editor_df.columns:
             editor_styled = editor_styled.apply(_highlight_tier, subset=["tier"])
-        edited_df = st.data_editor(
+        editor_key = (
+            f"table_{key_suffix}_{label}_{_param_hash}_{removed_revision}"
+        )
+        visible_row_ids = editor_df["_candidate_row_id"].astype(str).tolist()
+        st.data_editor(
             editor_styled,
             use_container_width=True,
             column_config={
@@ -2469,16 +2538,10 @@ def _render_spectrum(
             },
             disabled=locked_columns,
             hide_index=True,
-            key=f"table_{key_suffix}_{label}_{_param_hash}_{len(removed_ids)}",
+            key=editor_key,
+            on_change=_record_candidate_editor_removals,
+            args=(editor_key, removed_key, visible_row_ids),
         )
-        newly_removed = edited_df.loc[
-            edited_df["_remove"].fillna(False), "_candidate_row_id"
-        ].astype(str).tolist()
-        if newly_removed:
-            st.session_state[removed_key] = removed_ids + [
-                row_id for row_id in newly_removed if row_id not in removed_set
-            ]
-            st.rerun()
 
     if show_metrics and not display_df.empty and "mz_diff" in display_df.columns:
         st.caption(
@@ -2601,6 +2664,12 @@ def _label_from_scoped_state_key(key: str, prefix: str) -> str:
         label_and_count = parts[1] if len(parts) == 2 else tail
         return label_and_count.rsplit("::", 1)[0]
     if prefix in {"add_peaks_editor::", "add_peaks_apply::"}:
+        return tail.rsplit("::", 1)[0]
+    if prefix == "removed_candidates::":
+        for scope in ("dataset::", "active::", "compare::"):
+            if tail.startswith(scope):
+                tail = tail[len(scope):]
+                break
         return tail.rsplit("::", 1)[0]
     if "::" in tail and " :: " not in tail:
         return tail.split("::", 1)[1]

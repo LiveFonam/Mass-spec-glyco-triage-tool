@@ -4,7 +4,10 @@ import io
 import zipfile
 from PIL import Image
 
+import app
 from app import (
+    _candidate_removal_revision,
+    _candidate_removal_state_key,
     _characteristic_peaks_plot,
     _composition_proportion_plot,
     _compose_graph_grid_png,
@@ -12,7 +15,9 @@ from app import (
     _graph_cart_zip_bytes,
     _graph_export_filename,
     _galnac_color_map,
+    _merge_candidate_removal_ids,
     _pngs_to_zip_bytes,
+    _record_candidate_editor_removals,
     _with_candidate_row_ids,
 )
 
@@ -33,6 +38,52 @@ def test_candidate_row_ids_are_stable_and_unique() -> None:
 
     assert first["_candidate_row_id"].tolist() == second["_candidate_row_id"].tolist()
     assert first["_candidate_row_id"].is_unique
+
+
+def test_candidate_removal_state_is_shared_by_dataset_not_render_position() -> None:
+    label = "sample :: sheet 1"
+
+    shared_key = _candidate_removal_state_key(label, "abc123")
+
+    assert shared_key == "removed_candidates::dataset::sample :: sheet 1::abc123"
+    assert _candidate_removal_state_key(label, "other") != shared_key
+    assert _candidate_removal_state_key("another sample", "abc123") != shared_key
+
+
+def test_candidate_removal_revision_tracks_ids_not_only_row_count() -> None:
+    assert _candidate_removal_revision(["row-a"]) != _candidate_removal_revision(["row-b"])
+    assert _candidate_removal_revision(["row-a"]) == _candidate_removal_revision(["row-a"])
+
+
+def test_candidate_removal_merge_preserves_order_without_duplicates() -> None:
+    assert _merge_candidate_removal_ids(
+        ["first", "second"],
+        ["second", "third"],
+    ) == ["first", "second", "third"]
+
+
+def test_separate_candidate_editors_commit_both_removals(monkeypatch) -> None:
+    session_state = {
+        "table_top": {"edited_rows": {1: {"_remove": True}}},
+        "table_bottom": {"edited_rows": {"0": {"_remove": True}}},
+        "removed_top": [],
+        "removed_bottom": ["existing"],
+    }
+    monkeypatch.setattr(app.st, "session_state", session_state)
+
+    _record_candidate_editor_removals(
+        "table_top",
+        "removed_top",
+        ["top-0", "top-1"],
+    )
+    _record_candidate_editor_removals(
+        "table_bottom",
+        "removed_bottom",
+        ["bottom-0", "bottom-1"],
+    )
+
+    assert session_state["removed_top"] == ["top-1"]
+    assert session_state["removed_bottom"] == ["existing", "bottom-0"]
 
 
 def test_composition_proportions_combine_ions_and_use_total_signal() -> None:

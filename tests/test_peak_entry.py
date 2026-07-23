@@ -82,6 +82,10 @@ def test_spectrum_analysis_key_matching_is_scoped_to_label() -> None:
         label,
     )
     assert _is_spectrum_analysis_key(
+        f"removed_candidates::dataset::{label}::abc123",
+        label,
+    )
+    assert _is_spectrum_analysis_key(
         f"removed_candidates::active::{label}::abc123",
         label,
     )
@@ -106,3 +110,13 @@ def test_peak_entry_widget_keys_extract_multi_sheet_label() -> None:
         f"add_peaks_apply::{label}::2",
         "add_peaks_apply::",
     ) == label
+
+
+def test_candidate_removal_keys_extract_multi_sheet_label() -> None:
+    label = "sample :: sheet 1"
+
+    for scope in ("dataset", "active", "compare"):
+        assert _label_from_scoped_state_key(
+            f"removed_candidates::{scope}::{label}::abc123",
+            "removed_candidates::",
+        ) == label
