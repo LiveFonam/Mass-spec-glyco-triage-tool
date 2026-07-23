@@ -99,6 +99,21 @@ ppm_error = (observed - theoretical) / theoretical * 1e6
 Positive values mean the measurement is heavier than the proposed
 composition; negative values mean it is lighter.
 
+## Analysis profiles and graph comparison
+
+The Streamlit sidebar includes an optional **GalNAc-biased interpretation**
+profile. It keeps exact-mass candidates only when the GalNAc-labelled HexNAc
+count is at least one and is greater than or equal to the Gal count. This is a
+biological interpretation filter for GalNAc-rich O-glycan samples. It does not
+claim to distinguish GalNAc from GlcNAc from MS1 mass because both contribute
+the same HexNAc residue mass in this solver.
+
+For comparisons across datasets, **Use the same X-axis ranges for every
+sample** applies a user-defined shared m/z range to the raw spectrum and
+characteristic-peak graphs, plus a user-defined shared DP range to composition
+proportion graphs. The **Compare samples** control accepts any number of
+additional uploaded samples and renders each with the same shared ranges.
+
 ## CLI reference
 
 The installed console script is `glycan-ms`. It exposes two subcommands.

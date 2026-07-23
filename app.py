@@ -637,12 +637,43 @@ def _load_spectrums(
 # Candidate DataFrame construction
 # ---------------------------------------------------------------------------
 
+def _is_galnac_biased_composition(n_galnac: int, n_gal: int) -> bool:
+    """Return whether a composition fits the GalNAc-biased profile.
+
+    This is an interpretation filter, not a GalNAc versus GlcNAc
+    identification. The MS1 solver still matches the shared HexNAc residue
+    mass. The profile keeps candidates with at least one HexNAc residue and
+    with GalNAc-labelled residues greater than or equal to Gal residues.
+    """
+    return n_galnac > 0 and n_galnac >= n_gal
+
+
+def _filter_galnac_biased_candidates(
+    cands: Iterable[Candidate],
+    *,
+    enabled: bool,
+) -> list[Candidate]:
+    """Apply the optional GalNAc-rich composition prior."""
+    candidates = list(cands)
+    if not enabled:
+        return candidates
+    return [
+        candidate
+        for candidate in candidates
+        if _is_galnac_biased_composition(
+            candidate.n_galnac,
+            candidate.n_gal,
+        )
+    ]
+
+
 def _candidates_to_dataframe(
     cands: list[Candidate],
     spectrum_peaks: list[Peak] | None = None,
     *,
     da_tol: float = 0.7,
     strictness: str = "strict",
+    galnac_biased: bool = False,
 ) -> pd.DataFrame:
     """Convert solver output to a DataFrame with the columns the UI expects.
 
@@ -654,6 +685,10 @@ def _candidates_to_dataframe(
     candidate table and the plot overlay never show stacked markers
     for the same composition.
     """
+    cands = _filter_galnac_biased_candidates(
+        cands,
+        enabled=galnac_biased,
+    )
     if not cands:
         return pd.DataFrame(
             columns=[
@@ -888,6 +923,7 @@ def _characteristic_peaks_plot(
     label: str,
     *,
     normalize: bool = False,
+    x_range: tuple[float, float] | None = None,
 ) -> graph_objects.Figure:
     """Build the clean publication peak graph from retained table rows."""
     rows = _curated_peak_rows(candidates)
@@ -901,6 +937,8 @@ def _characteristic_peaks_plot(
             title=f"{label} - Characteristic Sugar Peaks",
             template="simple_white", height=430,
         )
+        if x_range is not None:
+            fig.update_xaxes(range=list(x_range))
         return fig
     maximum = max(float(rows["intensity"].max()), 1.0)
     y_values = [
@@ -958,7 +996,10 @@ def _characteristic_peaks_plot(
         dragmode="zoom",
         hovermode="closest",
         margin=dict(l=72, r=25, t=60, b=70),
-        xaxis=dict(title="m/z", range=[mz_min, mz_max]),
+        xaxis=dict(
+            title="m/z",
+            range=list(x_range) if x_range is not None else [mz_min, mz_max],
+        ),
         yaxis=dict(
             title="Intensity (% of maximum)" if normalize else "Intensity",
             ticksuffix="%" if normalize else "",
@@ -975,6 +1016,7 @@ def _composition_proportion_plot(
     color_mode: str = "distinct",
     base_color: str = _DEFAULT_GALNAC_GREEN,
     distinct_colors: dict[int, str] | None = None,
+    x_range: tuple[float, float] | None = None,
 ) -> graph_objects.Figure:
     """Build stacked signal proportions by DP from the retained candidates."""
     fig = graph_objects.Figure()
@@ -988,6 +1030,8 @@ def _composition_proportion_plot(
             title=f"{label} - Composition Proportions",
             template="simple_white", height=430,
         )
+        if x_range is not None:
+            fig.update_xaxes(range=list(x_range))
         return fig
 
     source = candidates.copy()
@@ -1004,6 +1048,8 @@ def _composition_proportion_plot(
             title=f"{label} - Composition Proportions",
             template="simple_white", height=430,
         )
+        if x_range is not None:
+            fig.update_xaxes(range=list(x_range))
         return fig
 
     grouped = (
@@ -1090,7 +1136,11 @@ def _composition_proportion_plot(
         margin=dict(l=70, r=25, t=55, b=125),
         xaxis=dict(
             title="Degree of Polymerization (DP)",
-            range=[dp_min - 0.5, dp_max + 0.5],
+            range=(
+                list(x_range)
+                if x_range is not None
+                else [dp_min - 0.5, dp_max + 0.5]
+            ),
             tickmode="linear", dtick=1,
         ),
         yaxis=dict(
@@ -1115,6 +1165,7 @@ def _spectrum_plot(
     style: str = "sticks",
     mz_min: float = 1000.0,
     mz_max: float | None = None,
+    fixed_x_range: tuple[float, float] | None = None,
     auto_zoom_detail: bool = False,
     measure_lines: tuple[float | None, float | None] = (None, None),
     hover_min_intensity: float = 0.0,
@@ -1140,12 +1191,15 @@ def _spectrum_plot(
     instead of hiding information for low-intensity peaks.
     """
     fig = graph_objects.Figure()
-    view_mz_min = max(mz_min, 1000.0) if auto_zoom_detail else mz_min
-    view_mz_max = (
-        min(mz_max, 5050.0)
-        if auto_zoom_detail and mz_max is not None
-        else mz_max
-    )
+    if fixed_x_range is not None:
+        view_mz_min, view_mz_max = fixed_x_range
+    else:
+        view_mz_min = max(mz_min, 1000.0) if auto_zoom_detail else mz_min
+        view_mz_max = (
+            min(mz_max, 5050.0)
+            if auto_zoom_detail and mz_max is not None
+            else mz_max
+        )
     visible_peaks: list[Peak] = []
     if peaks:
         # Chart-only filter: show only peaks inside the selected m/z
@@ -1337,9 +1391,12 @@ def _spectrum_plot(
         dragmode="zoom",
         showlegend=True,
     )
-    # Use the actual data extent inside the selected window so an empty
-    # 0-600 prefix (or any other empty prefix/suffix) is never displayed.
-    if data_mz_max > data_mz_min:
+    # A fixed range makes separate sample graphs directly comparable.
+    if fixed_x_range is not None:
+        fig.update_xaxes(range=list(fixed_x_range))
+    # Otherwise use the actual data extent inside the selected window so an
+    # empty prefix or suffix is never displayed.
+    elif data_mz_max > data_mz_min:
         fig.update_xaxes(range=[data_mz_min, data_mz_max])
     else:
         single_pad = max(
@@ -1596,6 +1653,23 @@ def _render_peak_entry_editor(label: str, spectrum: Spectrum) -> None:
                 st.rerun()
 
 
+def _validated_axis_range(
+    enabled: bool,
+    lower: float,
+    upper: float,
+) -> tuple[float, float] | None:
+    """Return a finite increasing axis range when shared axes are enabled."""
+    if not enabled:
+        return None
+    lower_value = float(lower)
+    upper_value = float(upper)
+    if not math.isfinite(lower_value) or not math.isfinite(upper_value):
+        return None
+    if upper_value <= lower_value:
+        return None
+    return lower_value, upper_value
+
+
 def _render_spectrum(
     label: str,
     *,
@@ -1623,6 +1697,27 @@ def _render_spectrum(
 
     peaks: list[Peak] = list(sp.peaks)
     candidates: pd.DataFrame = st.session_state.get(_cand_storage_key, pd.DataFrame())
+    shared_axis_enabled = (
+        bool(st.session_state.get("shared_x_axes_enabled", False))
+        and bool(st.session_state.get("shared_x_axes_valid", False))
+    )
+    shared_mz_x_range = _validated_axis_range(
+        shared_axis_enabled,
+        float(st.session_state.get("shared_mz_x_min", 1000.0)),
+        float(st.session_state.get("shared_mz_x_max", 10000.0)),
+    )
+    shared_dp_x_range = _validated_axis_range(
+        shared_axis_enabled,
+        float(st.session_state.get("shared_dp_x_min", 0.0)),
+        float(st.session_state.get("shared_dp_x_max", 60.0)),
+    )
+    shared_axis_signature = (
+        "auto"
+        if not shared_axis_enabled
+        else (
+            f"mz-{shared_mz_x_range}-dp-{shared_dp_x_range}"
+        )
+    )
     candidates_with_ids = _with_candidate_row_ids(candidates)
     removed_key = f"removed_candidates::{key_suffix}::{label}::{_param_hash}"
     removed_ids = list(st.session_state.get(removed_key, []))
@@ -2082,6 +2177,7 @@ def _render_spectrum(
             # 1000 m/z.
             mz_min=float(st.session_state.get("sidebar_mz_lo", 1000.0)),
             mz_max=float(st.session_state.get("sidebar_mz_hi", 10000.0)),
+            fixed_x_range=shared_mz_x_range,
             auto_zoom_detail=auto_zoom_detail,
             measure_lines=(_measure_state.get("A"), _measure_state.get("B")),
             # Every peak is now hoverable/selectable; this threshold is
@@ -2102,7 +2198,7 @@ def _render_spectrum(
         _zoom_sig = "detail" if auto_zoom_detail else "full"
         _plot_key = (
             f"{plot_key}::{_ions_sig}::{_a_sig}{_b_sig}::"
-            f"{_zoom_sig}::{_param_hash}"
+            f"{_zoom_sig}::{shared_axis_signature}::{_param_hash}"
         )
         plot_event = None
         with st.expander(
@@ -2251,7 +2347,10 @@ def _render_spectrum(
                     key=picker_key,
                 )
     characteristic_fig = _characteristic_peaks_plot(
-        display_df, new_name, normalize=normalize_curated
+        display_df,
+        new_name,
+        normalize=normalize_curated,
+        x_range=shared_mz_x_range,
     )
     characteristic_fig.update_layout(title=characteristic_graph_title)
     with st.expander(
@@ -2282,6 +2381,7 @@ def _render_spectrum(
         color_mode=proportion_color_mode,
         base_color=proportion_base_color,
         distinct_colors=distinct_galnac_colors,
+        x_range=shared_dp_x_range,
     )
     proportion_fig.update_layout(title=proportion_graph_title)
     with st.expander(
@@ -2404,6 +2504,7 @@ def _render_spectrum(
                 ",".join(show_ions),
                 style,
                 str(auto_zoom_detail),
+                shared_axis_signature,
                 str(normalize_curated),
                 raw_graph_title,
                 characteristic_graph_title,
@@ -2444,6 +2545,7 @@ _PREFIXES = (
     "table_",
     "compare_plot::",
     "compare_pick::",
+    "compare_picks_v2::",
     "download_png::",
     "download_xlsx::",
     "download_spectrum_png::",
@@ -2647,6 +2749,15 @@ def main() -> None:
         # candidate DataFrame across all peaks so the screener sees the
         # whole set (and can detect companion + series relationships).
         _all_cands: list[Candidate] = []
+        _manual_galnac_biased = bool(
+            st.session_state.get("galnac_biased_profile", False)
+        )
+        if _manual_galnac_biased:
+            manual_panel.caption(
+                "GalNAc-biased interpretation is active. Only candidates with "
+                "at least one HexNAc and GalNAc-labelled count greater than or "
+                "equal to Gal count are shown."
+            )
         # H+ is excluded per the user's standing rule: H+ is suppressed
         # everywhere in the app. Only Na+ and K+ are tried here.
         _adhoc_adducts = [a for a in Adduct if a != Adduct.H]
@@ -2668,7 +2779,14 @@ def main() -> None:
                 n_hi=20,
                 m_lo=0,
                 m_hi=20,
-            )[:2]
+            )
+            if _manual_galnac_biased:
+                _hits = [
+                    hit
+                    for hit in _hits
+                    if _is_galnac_biased_composition(hit[0], hit[1])
+                ]
+            _hits = _hits[:2]
             _matched = False
             _closest_n = _closest_m = 0
             _closest_ad: Adduct | None = None
@@ -2712,6 +2830,7 @@ def main() -> None:
                 _spectrum_peaks,
                 da_tol=0.5,
                 strictness="strict",
+                galnac_biased=_manual_galnac_biased,
             )
             # Add a human-readable composition string and a theoretical m/z
             # column, then re-order so composition comes first, followed
@@ -2905,6 +3024,83 @@ def main() -> None:
         )
         run_screener = st.checkbox("Run screener", value=True)
 
+        st.session_state.setdefault("galnac_biased_profile", False)
+        galnac_biased = st.toggle(
+            "GalNAc-biased interpretation",
+            key="galnac_biased_profile",
+            help=(
+                "Keeps exact-mass candidates only when they contain at least "
+                "one HexNAc and the GalNAc-labelled count is greater than or "
+                "equal to the Gal count. This is a biological interpretation "
+                "filter, not direct GalNAc versus GlcNAc identification."
+            ),
+        )
+        if galnac_biased:
+            st.caption(
+                "GalNAc-biased mode is active. MS1 still measures the shared "
+                "203.0794 Da HexNAc residue mass."
+            )
+
+        st.header("Shared graph X-axes")
+        st.session_state.setdefault("shared_x_axes_enabled", False)
+        shared_x_axes_enabled = st.toggle(
+            "Use the same X-axis ranges for every sample",
+            key="shared_x_axes_enabled",
+            help=(
+                "Applies one fixed m/z range to raw and characteristic graphs "
+                "and one fixed DP range to composition graphs."
+            ),
+        )
+        st.session_state.setdefault("shared_mz_x_min", float(mz_lo))
+        st.session_state.setdefault("shared_mz_x_max", float(mz_hi))
+        shared_mz_columns = st.columns(2)
+        with shared_mz_columns[0]:
+            shared_mz_x_min = st.number_input(
+                "Shared m/z minimum",
+                min_value=0.0,
+                max_value=100000.0,
+                step=50.0,
+                key="shared_mz_x_min",
+                disabled=not shared_x_axes_enabled,
+            )
+        with shared_mz_columns[1]:
+            shared_mz_x_max = st.number_input(
+                "Shared m/z maximum",
+                min_value=0.0,
+                max_value=100000.0,
+                step=50.0,
+                key="shared_mz_x_max",
+                disabled=not shared_x_axes_enabled,
+            )
+        st.session_state.setdefault("shared_dp_x_min", 0.0)
+        st.session_state.setdefault("shared_dp_x_max", 60.0)
+        shared_dp_columns = st.columns(2)
+        with shared_dp_columns[0]:
+            shared_dp_x_min = st.number_input(
+                "Shared DP minimum",
+                min_value=0.0,
+                max_value=500.0,
+                step=1.0,
+                key="shared_dp_x_min",
+                disabled=not shared_x_axes_enabled,
+            )
+        with shared_dp_columns[1]:
+            shared_dp_x_max = st.number_input(
+                "Shared DP maximum",
+                min_value=0.0,
+                max_value=500.0,
+                step=1.0,
+                key="shared_dp_x_max",
+                disabled=not shared_x_axes_enabled,
+            )
+        shared_x_axes_valid = (
+            float(shared_mz_x_max) > float(shared_mz_x_min)
+            and float(shared_dp_x_max) > float(shared_dp_x_min)
+        )
+        st.session_state["shared_x_axes_valid"] = shared_x_axes_valid
+        if shared_x_axes_enabled and not shared_x_axes_valid:
+            st.error("Each shared X-axis maximum must be greater than its minimum.")
+
     # ---- Parse uploaded files -----------------------------------------
     parsed: dict[str, Spectrum] = dict(st.session_state.get("parsed", {}))
     tab_labels: list[str] = list(st.session_state.get("tab_labels", []))
@@ -3029,7 +3225,7 @@ def main() -> None:
     _param_signature = (
         f"{da_tol}|{mz_lo}|{mz_hi}|{min_intensity}|"
         f"{','.join(str(a.value) for a in sorted(adducts, key=lambda x: x.value))}|"
-        f"{run_screener}"
+        f"{run_screener}|{galnac_biased}"
     )
     _param_hash = hashlib.md5(_param_signature.encode()).hexdigest()[:10]
     # Publish the active hash so the per-spectrum renderers (which run
@@ -3081,6 +3277,7 @@ def main() -> None:
                 sp.peaks,
                 da_tol=da_tol_for_solver,
                 strictness="strict" if run_screener else "off",
+                galnac_biased=galnac_biased,
             )
             st.session_state[_cand_key(lbl)] = df
             st.session_state[_spec_key(lbl)] = sp
@@ -3100,18 +3297,34 @@ def main() -> None:
     st.divider()
     st.subheader("Compare")
     if len(tab_labels) >= 2:
-        compare_label = st.selectbox(
-            "Compare against",
-            options=[l for l in tab_labels if l != active_label],
-            key=f"compare_pick::{active_label}",
+        comparison_options = [
+            candidate_label
+            for candidate_label in tab_labels
+            if candidate_label != active_label
+        ]
+        comparison_labels = st.multiselect(
+            "Compare samples",
+            options=comparison_options,
+            default=comparison_options[:1],
+            key=f"compare_picks_v2::{active_label}",
+            help="Select any number of additional samples to render together.",
         )
-        lbl = compare_label
-        _render_spectrum(
-            lbl,
-            show_metrics=False,
-            plot_key=f"compare_plot::{lbl}",
-            key_suffix="compare",
-        )
+        if comparison_labels:
+            st.caption(
+                f"Showing {1 + len(comparison_labels)} samples with the active "
+                "sample included."
+            )
+        else:
+            st.caption("Select one or more samples to compare.")
+        for comparison_label in comparison_labels:
+            lbl = comparison_label
+            st.markdown(f"### {lbl}")
+            _render_spectrum(
+                lbl,
+                show_metrics=False,
+                plot_key=f"compare_plot::{lbl}",
+                key_suffix="compare",
+            )
     else:
         st.caption("Upload at least two spectra to enable Compare.")
 
