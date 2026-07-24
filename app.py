@@ -674,6 +674,7 @@ def _candidates_to_dataframe(
     da_tol: float = 0.7,
     strictness: str = "strict",
     galnac_biased: bool = False,
+    include_theoretical_mz: bool = False,
 ) -> pd.DataFrame:
     """Convert solver output to a DataFrame with the columns the UI expects.
 
@@ -690,18 +691,19 @@ def _candidates_to_dataframe(
         enabled=galnac_biased,
     )
     if not cands:
-        return pd.DataFrame(
-            columns=[
-                "mz",
-                "intensity",
-                "n_galnac",
-                "n_gal",
-                "total",
-                "ion",
-                "|ppm|",
-                "mz_diff",
-            ]
-        )
+        columns = [
+            "mz",
+            "intensity",
+            "n_galnac",
+            "n_gal",
+            "total",
+            "ion",
+            "|ppm|",
+            "mz_diff",
+        ]
+        if include_theoretical_mz:
+            columns.append("theoretical_mz")
+        return pd.DataFrame(columns=columns)
     # Dedup by (n_galnac, n_gal, adduct), keeping the highest-intensity
     # observation. The Candidate dataclass is frozen so we sort and
     # take the first of each group.
@@ -718,18 +720,19 @@ def _candidates_to_dataframe(
         deduped_cands.append(c)
     rows: list[dict[str, Any]] = []
     for c in deduped_cands:
-        rows.append(
-            {
-                "mz": c.observed_mz,
-                "intensity": c.intensity,
-                "n_galnac": c.n_galnac,
-                "n_gal": c.n_gal,
-                "total": c.n_galnac + c.n_gal,
-                "ion": _ADDUCT_LABELS[c.adduct],
-                "|ppm|": round(abs(c.ppm_error), 2),
-                "mz_diff": round(c.mz_diff, 4),
-            }
-        )
+        row = {
+            "mz": c.observed_mz,
+            "intensity": c.intensity,
+            "n_galnac": c.n_galnac,
+            "n_gal": c.n_gal,
+            "total": c.n_galnac + c.n_gal,
+            "ion": _ADDUCT_LABELS[c.adduct],
+            "|ppm|": round(abs(c.ppm_error), 2),
+            "mz_diff": round(c.mz_diff, 4),
+        }
+        if include_theoretical_mz:
+            row["theoretical_mz"] = c.theoretical_mz
+        rows.append(row)
     df = pd.DataFrame(rows)
     if spectrum_peaks is not None:
         df = screen_candidates(
@@ -2900,6 +2903,7 @@ def main() -> None:
                 da_tol=0.5,
                 strictness="strict",
                 galnac_biased=_manual_galnac_biased,
+                include_theoretical_mz=True,
             )
             # Add a human-readable composition string and a theoretical m/z
             # column, then re-order so composition comes first, followed
@@ -2913,7 +2917,6 @@ def main() -> None:
                     for r in _df.itertuples()
                 ],
             )
-            _df.insert(2, "theoretical_mz", [c.theoretical_mz for c in _all_cands])
             # Per-peak status: `match` when at least one of the 2
             # closest candidates is within 0.5 Da, otherwise an
             # explicit "no close match" callout quoting the closest
