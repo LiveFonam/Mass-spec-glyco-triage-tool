@@ -330,6 +330,59 @@ def test_candidates_to_dataframe_dedup_by_composition() -> None:
     assert df.iloc[0]["mz_diff"] == 0.0
 
 
+def test_manual_composition_theoretical_mz_stays_aligned_after_dedup() -> None:
+    from app import _candidates_to_dataframe  # type: ignore[import-not-found]
+
+    measured_mzs = [2154, 2354, 2850, 2355, 4774, 3774, 4776, 2007, 4205]
+    adducts = [adduct for adduct in Adduct if adduct != Adduct.H]
+    candidates: list[Candidate] = []
+    for measured_mz in measured_mzs:
+        hits = nearest_compositions(
+            measured_mz,
+            adducts,
+            n_lo=0,
+            n_hi=20,
+            m_lo=0,
+            m_hi=20,
+        )[:2]
+        for n_galnac, n_gal, adduct, theoretical_mz in hits:
+            neutral_mass = n_galnac * GALNAC + n_gal * GAL + H2O
+            candidates.append(
+                Candidate(
+                    n_galnac=n_galnac,
+                    n_gal=n_gal,
+                    adduct=adduct,
+                    neutral_mass=neutral_mass,
+                    theoretical_mz=theoretical_mz,
+                    observed_mz=measured_mz,
+                    ppm_error=(measured_mz - theoretical_mz) / theoretical_mz * 1e6,
+                    mz_diff=measured_mz - theoretical_mz,
+                    intensity=1.0,
+                )
+            )
+
+    spectrum_peaks = dedup_peaks(
+        [Peak(mz=mz, intensity=1.0) for mz in measured_mzs],
+        bin_width=0.01,
+    )
+    result = _candidates_to_dataframe(
+        candidates,
+        spectrum_peaks,
+        da_tol=0.5,
+        strictness="strict",
+        include_theoretical_mz=True,
+    )
+
+    assert len(candidates) == 18
+    assert len(result) == 15
+    assert len(result["theoretical_mz"]) == len(result.index)
+    for row in result.itertuples():
+        assert row.mz - row.theoretical_mz == pytest.approx(
+            row.mz_diff,
+            abs=0.00005,
+        )
+
+
 # ---------------------------------------------------------------------------
 # 5d) nearest_compositions: closest 2 are still returned for inputs
 #     outside the residue grid. This locks in the manual-m/z fallback

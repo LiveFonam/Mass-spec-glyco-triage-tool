@@ -134,15 +134,16 @@ assert len(calls) == 1, (
 print("OK: only one _render_spectrum(active_label) call site")
 
 
-# 7. The first_only branch still uses st.rerun() to flush between spectra
-first_only_marker = find_line(r"if len\(missing\) > 1:")
-assert first_only_marker > 0, "first_only branch not found"
-rerun_marker = find_line(r"st\.rerun\(\)", first_only_marker)
-print(f"first_only branch: {first_only_marker}, st.rerun: {rerun_marker}")
-assert rerun_marker > first_only_marker, (
-    "first_only branch should still have st.rerun() after the per-spectrum solve"
+# 7. The pre-render block reruns after all missing spectra are solved so the
+# picker and comparison controls are enabled with a complete cache.
+pre_render_marker = find_line(r"if any\(_cand_key\(lbl\) not in st\.session_state")
+assert pre_render_marker > 0, "pre-render missing-spectrum block not found"
+rerun_marker = find_line(r"st\.rerun\(\)", pre_render_marker)
+print(f"pre-render block: {pre_render_marker}, st.rerun: {rerun_marker}")
+assert rerun_marker > pre_render_marker, (
+    "pre-render block should call st.rerun() after all missing spectra are solved"
 )
-print("OK: first_only branch still calls st.rerun() after each spectrum")
+print("OK: pre-render block reruns after all missing spectra are solved")
 
 
 # 7b. The rename popover has a "prefix for all samples" control
