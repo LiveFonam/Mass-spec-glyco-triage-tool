@@ -1585,6 +1585,136 @@ def _peak_entries_to_peaks(rows: pd.DataFrame) -> tuple[list[Peak], list[str]]:
     return additions, errors
 
 
+def _peak_text_to_peaks(text: str) -> tuple[list[Peak], list[str]]:
+    """Parse plain m/z values or m/z:intensity pairs without dropping valid rows."""
+    peaks: list[Peak] = []
+    errors: list[str] = []
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        normalized_line = re.sub(r"\s*:\s*", ":", raw_line.strip())
+        if not normalized_line:
+            continue
+        for token in re.split(r"[\s,;]+", normalized_line):
+            if not token:
+                continue
+            if ":" in token:
+                mz_text, intensity_text = token.split(":", 1)
+            else:
+                mz_text, intensity_text = token, "1"
+            try:
+                mz = float(mz_text)
+                intensity = float(intensity_text)
+            except ValueError:
+                errors.append(
+                    f"Line {line_number}: {token!r} is not m/z:intensity numeric data."
+                )
+                continue
+            if not math.isfinite(mz) or not math.isfinite(intensity):
+                errors.append(
+                    f"Line {line_number}: {token!r} must contain finite numbers."
+                )
+                continue
+            peaks.append(Peak(mz=mz, intensity=intensity))
+    return peaks, errors
+
+
+def _closest_composition_rows(
+    peaks: Iterable[Peak],
+    adducts: Iterable[Adduct],
+    *,
+    galnac_biased: bool = False,
+) -> pd.DataFrame:
+    """Return exactly one accepted closest-composition row per entered peak."""
+    selected_adducts = list(adducts) or [Adduct.NA, Adduct.K]
+    columns = [
+        "accepted",
+        "mz",
+        "intensity",
+        "n_galnac",
+        "n_gal",
+        "total",
+        "ion",
+        "theoretical_mz",
+        "|ppm|",
+        "mz_diff",
+    ]
+    rows: list[dict[str, Any]] = []
+    for peak in peaks:
+        hits = nearest_compositions(
+            peak.mz,
+            selected_adducts,
+            n_lo=0,
+            n_hi=20,
+            m_lo=0,
+            m_hi=20,
+        )
+        if galnac_biased:
+            hits = [
+                hit
+                for hit in hits
+                if _is_galnac_biased_composition(hit[0], hit[1])
+            ]
+        n_galnac, n_gal, adduct, theoretical_mz = hits[0]
+        mz_diff = peak.mz - theoretical_mz
+        rows.append(
+            {
+                "accepted": "YES",
+                "mz": peak.mz,
+                "intensity": peak.intensity,
+                "n_galnac": n_galnac,
+                "n_gal": n_gal,
+                "total": n_galnac + n_gal,
+                "ion": _ADDUCT_LABELS[adduct],
+                "theoretical_mz": theoretical_mz,
+                "|ppm|": round(abs(mz_diff / theoretical_mz * 1_000_000.0), 2),
+                "mz_diff": round(mz_diff, 4),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _merge_manual_peak_candidates(
+    regular_candidates: pd.DataFrame,
+    manual_peaks: list[Peak],
+    adducts: Iterable[Adduct],
+    spectrum_peaks: list[Peak],
+    *,
+    da_tol: float,
+    strictness: str,
+    galnac_biased: bool = False,
+) -> pd.DataFrame:
+    """Replace solver rows for manual peaks with one accepted closest row each."""
+    merged = regular_candidates.copy()
+    if not manual_peaks:
+        return merged
+    if not merged.empty and "mz" in merged.columns:
+        keep_regular = pd.Series(True, index=merged.index)
+        for manual_peak in manual_peaks:
+            keep_regular &= (merged["mz"] - manual_peak.mz).abs() > 1e-9
+        merged = merged[keep_regular].copy()
+    manual_candidates = _closest_composition_rows(
+        manual_peaks,
+        adducts,
+        galnac_biased=galnac_biased,
+    )
+    manual_candidates["_manual_entry_order"] = range(len(manual_candidates))
+    manual_candidates = screen_candidates(
+        manual_candidates,
+        spectrum_peaks,
+        da_tol=da_tol,
+        strictness=strictness,
+    )
+    manual_candidates = manual_candidates.sort_values(
+        "_manual_entry_order",
+        kind="stable",
+    ).drop(columns=["_manual_entry_order"])
+    manual_candidates["accepted"] = "YES"
+    return pd.concat(
+        [merged, manual_candidates],
+        ignore_index=True,
+        sort=False,
+    )
+
+
 def _spectrum_with_added_peaks(
     spectrum: Spectrum,
     additions: Iterable[Peak],
@@ -1640,7 +1770,7 @@ def _invalidate_spectrum_analysis(label: str) -> None:
 
 
 def _render_peak_entry_editor(label: str, spectrum: Spectrum) -> None:
-    """Render a two-column table that appends peaks to the active spectrum."""
+    """Append accepted table or m/z:intensity rows to the active spectrum."""
     notice_key = f"add_peaks_notice::{label}"
     notice = st.session_state.pop(notice_key, None)
     editor_version_key = f"add_peaks_editor_version::{label}"
@@ -1653,9 +1783,16 @@ def _render_peak_entry_editor(label: str, spectrum: Spectrum) -> None:
         if notice:
             st.success(str(notice))
         st.caption(
-            "Add one or more rows with both values, then apply them. "
-            "The analyser will recalculate the candidate table and all graphs."
+            "Paste m/z:intensity rows or use the table. Every finite numeric "
+            "entry is accepted and assigned its closest composition."
         )
+        bulk_text = st.text_area(
+            "Bulk peak rows",
+            key=f"add_peaks_bulk::{label}::{editor_version}",
+            placeholder="1298:10000\n1460.367:25000\n2355:8000",
+            help="Peak m/z goes on the left and intensity goes on the right.",
+        )
+        bulk_additions, bulk_errors = _peak_text_to_peaks(bulk_text)
         entry_rows = pd.DataFrame(
             {
                 "mz": pd.Series([None], dtype="Float64"),
@@ -1684,15 +1821,17 @@ def _render_peak_entry_editor(label: str, spectrum: Spectrum) -> None:
             key=f"add_peaks_editor::{label}::{editor_version}",
         )
         if st.button(
-            "Add peaks and reanalyse",
+            "Add every row and reanalyse",
             key=f"add_peaks_apply::{label}::{editor_version}",
             type="primary",
         ):
-            additions, errors = _peak_entries_to_peaks(edited_rows)
+            table_additions, table_errors = _peak_entries_to_peaks(edited_rows)
+            additions = [*table_additions, *bulk_additions]
+            errors = [*table_errors, *bulk_errors]
             if errors:
-                st.error("\n".join(errors))
-            elif not additions:
-                st.warning("Enter at least one complete m/z and intensity row.")
+                st.warning("\n".join(errors))
+            if not additions:
+                st.warning("Enter at least one numeric m/z or m/z:intensity row.")
             else:
                 parsed = dict(st.session_state.get("parsed", {}))
                 base_spectrum = parsed.get(label, spectrum)
@@ -1700,15 +1839,22 @@ def _render_peak_entry_editor(label: str, spectrum: Spectrum) -> None:
                     base_spectrum,
                     additions,
                 )
+                manual_key = f"manual_peak_entries::{label}"
+                manual_records = list(st.session_state.get(manual_key, []))
+                manual_records.extend(
+                    {"mz": peak.mz, "intensity": peak.intensity}
+                    for peak in additions
+                )
+                st.session_state[manual_key] = manual_records
                 st.session_state["parsed"] = parsed
                 _invalidate_spectrum_analysis(label)
                 st.session_state[editor_version_key] = editor_version + 1
                 noun = "peak" if len(additions) == 1 else "peaks"
                 st.session_state[notice_key] = (
-                    f"Added {len(additions)} {noun}. Analysis and graphs were updated."
+                    f"YES: added all {len(additions)} {noun}. Each entered row "
+                    "was assigned its closest composition."
                 )
                 st.rerun()
-
 
 def _validated_axis_range(
     enabled: bool,
@@ -2195,6 +2341,20 @@ def _render_spectrum(
         display_df = display_df[
             (display_df["mz"] >= _search_lo) & (display_df["mz"] <= _search_hi)
         ]
+    if "accepted" in retained_candidates.columns:
+        accepted_rows = retained_candidates[
+            retained_candidates["accepted"].fillna("").eq("YES")
+        ]
+        display_df = pd.concat(
+            [display_df, accepted_rows],
+            ignore_index=False,
+            sort=False,
+        )
+        if "_candidate_row_id" in display_df.columns:
+            display_df = display_df.drop_duplicates(
+                subset=["_candidate_row_id"],
+                keep="first",
+            )
 
     curate_col, undo_col, restore_col = st.columns([2, 1, 1])
     with curate_col:
@@ -2524,6 +2684,10 @@ def _render_spectrum(
                 "mz_diff": st.column_config.NumberColumn("off by", format="%.4f"),
                 "tier": st.column_config.TextColumn("tier"),
                 "screen_notes": st.column_config.TextColumn("screen notes"),
+                "accepted": st.column_config.TextColumn("accepted"),
+                "theoretical_mz": st.column_config.NumberColumn(
+                    "closest theoretical m/z", format="%.4f"
+                ),
                 # Companion + series score columns live in the
                 # DataFrame (from screen_candidates) but were never
                 # added to this path's column config, so the
@@ -2648,8 +2812,10 @@ _PREFIXES = (
     "hide_low_sn::",
     "add_peaks_notice::",
     "add_peaks_editor_version::",
+    "add_peaks_bulk::",
     "add_peaks_editor::",
     "add_peaks_apply::",
+    "manual_peak_entries::",
 )
 
 
@@ -2666,8 +2832,10 @@ def _label_from_scoped_state_key(key: str, prefix: str) -> str:
         parts = tail.split("::", 1)
         label_and_count = parts[1] if len(parts) == 2 else tail
         return label_and_count.rsplit("::", 1)[0]
-    if prefix in {"add_peaks_editor::", "add_peaks_apply::"}:
+    if prefix in {"add_peaks_bulk::", "add_peaks_editor::", "add_peaks_apply::"}:
         return tail.rsplit("::", 1)[0]
+    if prefix == "manual_peak_entries::":
+        return tail
     if prefix == "removed_candidates::":
         for scope in ("dataset::", "active::", "compare::"):
             if tail.startswith(scope):
@@ -2766,259 +2934,103 @@ def main() -> None:
     )
     st.title("MS Analyzer")
 
-    # ---- Manual m/z entry (first page, works without any file upload) --
+    # ---- Manual peak entry (first page, works without any file upload) ----
     manual_panel = st.expander("Manual m/z list", expanded=False)
     manual_panel.markdown(
-        "Type m/z values (one per line) and click **Find composition**. "
-        "The app tries every GalNAc / Gal / Na+, K+ combo, shows the "
-        "closest match per value."
+        "Enter one peak per line as **m/z:intensity**, for example "
+        "`1298:10000`. Plain m/z values still work and receive intensity 1. "
+        "Every numeric row is accepted and assigned its closest composition."
     )
     _check_mz_text = manual_panel.text_area(
-        "Measured m/z values",
+        "Peak rows",
         value=st.session_state.get("adhoc_check_mz", ""),
         key="adhoc_check_mz_widget",
-        height=140,
+        height=180,
         label_visibility="visible",
         placeholder=(
-            "Enter m/z values, one per line, e.g.\n"
-            "1460.367\n"
-            "1257.324\n"
-            "1095.281"
+            "1298:10000\n"
+            "1460.367:25000\n"
+            "2355:8000"
         ),
     )
     if manual_panel.button("Find composition", key="analyse_manual_list", type="primary"):
-        # Parse the m/z values.
-        raw_tokens = re.split(r"[\s,;]+", _check_mz_text)
-        _measured_mzs: list[float] = []
-        for tok in raw_tokens:
-            tok = tok.strip()
-            if not tok:
-                continue
-            try:
-                _measured_mzs.append(float(tok))
-            except ValueError:
-                manual_panel.warning(f"Ignoring non-numeric value: {tok!r}")
-        if not _measured_mzs:
-            manual_panel.error("Enter at least one numeric m/z value first.")
-            st.stop()
-        st.session_state["adhoc_check_mz"] = _check_mz_text
-        st.session_state["adhoc_check_last_result"] = {
-            "measured_mzs": _measured_mzs,
-        }
+        _manual_peaks, _parse_errors = _peak_text_to_peaks(_check_mz_text)
+        if _parse_errors:
+            manual_panel.warning("\n".join(_parse_errors))
+        if not _manual_peaks:
+            manual_panel.error("Enter at least one numeric m/z or m/z:intensity row.")
+        else:
+            st.session_state["adhoc_check_mz"] = _check_mz_text
+            st.session_state["adhoc_check_last_result"] = {
+                "peaks": [
+                    {"mz": peak.mz, "intensity": peak.intensity}
+                    for peak in _manual_peaks
+                ],
+            }
 
-    # Render the result table whenever we have a stored result.
     _check_result = st.session_state.get("adhoc_check_last_result")
-    if _check_result is not None and _check_result.get("measured_mzs"):
-        manual_panel.markdown("---")
-        manual_panel.markdown("**Composition check result**")
-        _measured_mzs = _check_result["measured_mzs"]
-        # Build a fake spectrum so the screener can look for companions.
-        _spectrum_peaks = dedup_peaks(
-            [Peak(mz=mz, intensity=1.0) for mz in _measured_mzs],
-            bin_width=0.01,
-        )
-        # For each m/z, find the closest composition. Build a single
-        # candidate DataFrame across all peaks so the screener sees the
-        # whole set (and can detect companion + series relationships).
-        _all_cands: list[Candidate] = []
+    _stored_peak_rows: list[dict[str, float]] = []
+    if isinstance(_check_result, dict):
+        raw_peak_rows = _check_result.get("peaks")
+        if isinstance(raw_peak_rows, list):
+            _stored_peak_rows = raw_peak_rows
+        elif _check_result.get("measured_mzs"):
+            _stored_peak_rows = [
+                {"mz": float(mz), "intensity": 1.0}
+                for mz in _check_result["measured_mzs"]
+            ]
+
+    if _stored_peak_rows:
+        _manual_peaks = [
+            Peak(mz=float(row["mz"]), intensity=float(row["intensity"]))
+            for row in _stored_peak_rows
+        ]
         _manual_galnac_biased = bool(
             st.session_state.get("galnac_biased_profile", False)
         )
+        _result_df = _closest_composition_rows(
+            _manual_peaks,
+            [Adduct.NA, Adduct.K],
+            galnac_biased=_manual_galnac_biased,
+        )
+        _result_df.insert(
+            1,
+            "composition",
+            [
+                f"{row.n_galnac} GalNAc + {row.n_gal} Gal + {row.ion}"
+                for row in _result_df.itertuples()
+            ],
+        )
+        manual_panel.markdown("---")
+        manual_panel.markdown("**Composition check result**")
         if _manual_galnac_biased:
             manual_panel.caption(
-                "GalNAc-biased interpretation is active. Only candidates with "
-                "at least one HexNAc and GalNAc-labelled count greater than or "
-                "equal to Gal count are shown."
+                "GalNAc-biased interpretation is active for closest composition "
+                "selection."
             )
-        # H+ is excluded per the user's standing rule: H+ is suppressed
-        # everywhere in the app. Only Na+ and K+ are tried here.
-        _adhoc_adducts = [a for a in Adduct if a != Adduct.H]
-        # Per-peak match state: maps the measured m/z (rounded to 4 dp
-        # for stable dict keys) to a dict of {'matched': bool,
-        # 'closest': (n, m, adduct, theoretical_mz, |diff|)}. We track
-        # this so that, when a peak has no composition within the
-        # 0.5 Da tolerance, the result table can still label the rows
-        # with the closest theoretical composition and its Da offset
-        # -- otherwise the user sees two PURGE rows with no signal
-        # that "these are the closest possible alternatives".
-        _DA_TOL_FOR_MATCH = 0.5
-        _peak_state: dict[float, dict] = {}
-        for _m in _measured_mzs:
-            _hits = nearest_compositions(
-                _m,
-                _adhoc_adducts,
-                n_lo=0,
-                n_hi=20,
-                m_lo=0,
-                m_hi=20,
-            )
-            if _manual_galnac_biased:
-                _hits = [
-                    hit
-                    for hit in _hits
-                    if _is_galnac_biased_composition(hit[0], hit[1])
-                ]
-            _hits = _hits[:2]
-            _matched = False
-            _closest_n = _closest_m = 0
-            _closest_ad: Adduct | None = None
-            _closest_th = 0.0
-            _closest_diff = float("inf")
-            for _an, _am, _aad, _ath in _hits:
-                _diff = abs(_m - _ath)
-                if _diff <= _DA_TOL_FOR_MATCH:
-                    _matched = True
-                if _diff < _closest_diff:
-                    _closest_diff = _diff
-                    _closest_n, _closest_m, _closest_ad, _closest_th = (
-                        _an, _am, _aad, _ath,
-                    )
-                _neut = _an * 203.0794 + _am * 162.0528 + 18.0106
-                _all_cands.append(
-                    Candidate(
-                        n_galnac=_an,
-                        n_gal=_am,
-                        adduct=_aad,
-                        neutral_mass=_neut,
-                        theoretical_mz=_ath,
-                        observed_mz=_m,
-                        ppm_error=(_m - _ath) / _ath * 1_000_000.0,
-                        mz_diff=_m - _ath,
-                        intensity=1.0,
-                    )
-                )
-            _peak_state[round(_m, 4)] = {
-                "matched": _matched,
-                "closest": (
-                    _closest_n, _closest_m, _closest_ad, _closest_th, _closest_diff
+        manual_panel.success(
+            f"YES: accepted all {len(_result_df)} numeric rows. "
+            "Tolerance and screener rules did not remove any entered peak."
+        )
+        manual_panel.dataframe(
+            _result_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "accepted": st.column_config.TextColumn("Accepted"),
+                "composition": st.column_config.TextColumn("Closest composition"),
+                "mz": st.column_config.NumberColumn("Measured m/z", format="%.4f"),
+                "intensity": st.column_config.NumberColumn(
+                    "Intensity", format="%.2f"
                 ),
-            }
-        if _all_cands:
-            # Da-only pipeline: pass the user's Da tolerance through
-            # directly. No ppm conversion -- the Da slider binds
-            # uniformly across the whole m/z window.
-            _df = _candidates_to_dataframe(
-                _all_cands,
-                _spectrum_peaks,
-                da_tol=0.5,
-                strictness="strict",
-                galnac_biased=_manual_galnac_biased,
-                include_theoretical_mz=True,
-            )
-            # Add a human-readable composition string and a theoretical m/z
-            # column, then re-order so composition comes first, followed
-            # by the measured / theoretical / diff triple, then the
-            # screener tier, notes, and supporting evidence scores.
-            _df.insert(
-                0,
-                "composition",
-                [
-                    f"{r.n_galnac} GalNAc + {r.n_gal} Gal + {r.ion}"
-                    for r in _df.itertuples()
-                ],
-            )
-            # Per-peak status: `match` when at least one of the 2
-            # closest candidates is within 0.5 Da, otherwise an
-            # explicit "no close match" callout quoting the closest
-            # theoretical composition and its Da offset. Keyed by
-            # the row's observed m/z (rounded to 4 dp) so it
-            # aligns with the per-peak state tracked during the
-            # build loop, regardless of how _candidates_to_dataframe
-            # re-ordered rows.
-            def _status_for_row(_mz: float) -> str:
-                _st = _peak_state.get(round(_mz, 4))
-                if _st is None:
-                    return "match"
-                if _st["matched"]:
-                    return "match"
-                _cn, _cm, _cad, _cth, _cdiff = _st["closest"]
-                if _cad is None:
-                    return "no close match"
-                return (
-                    f"no close match - closest is {_cn} GalNAc + {_cm} Gal "
-                    f"+ {_cad.value} at {_cth:.4f} (off by {_cdiff:.2f} Da)"
-                )
-            _df["status"] = _df["mz"].map(_status_for_row)
-            # Place status right after composition for at-a-glance
-            # scanning. Inserting into a DataFrame is O(n) per call,
-            # so we add it last in the column order and then reorder.
-            _col_order = [
-                "composition",
-                "status",
-                "mz",
-                "theoretical_mz",
-                "mz_diff",
-                "tier",
-                "screen_notes",
-                "score_companion",
-                "score_series",
-            ]
-            _col_order = [c for c in _col_order if c in _df.columns]
-            _df = _df[_col_order]
-            # Roll up totals: how many candidates survived PURGE, and how
-            # many of those are Na+ vs K+. H+ is excluded by the user's
-            # standing rule, so it is never counted.
-            _surviving = _df[_df["tier"] != "PURGE"] if "tier" in _df.columns else _df
-            _n_total = len(_df)
-            _n_hits = len(_surviving)
-            _n_unmatched = sum(
-                1 for _mz in _measured_mzs
-                if not _peak_state.get(round(_mz, 4), {}).get("matched", False)
-            )
-            _ion_counts: dict[str, int] = {"Na+": 0, "K+": 0}
-            if not _surviving.empty:
-                for _comp in _surviving["composition"].astype(str):
-                    for _ion in _ion_counts:
-                        if _comp.endswith(f" + {_ion}"):
-                            _ion_counts[_ion] += 1
-                            break
-            manual_panel.markdown(
-                f"**{_n_total}** total candidates across "
-                f"**{len(_measured_mzs)}** measured value(s) - "
-                f"**{_n_hits}** survived the screener "
-                f"(**{_ion_counts['Na+']} Na+**, **{_ion_counts['K+']} K+**). "
-                f"**{_n_unmatched}** peak(s) had no composition within "
-                f"0.5 Da - the closest theoretical composition is shown "
-                f"with its Da offset. The screener column reports "
-                f"**GREEN** (companion + series + 13C envelope all "
-                f"observed), **YELLOW** (some signal), **RED** (off by "
-                f"more than 0.5 Da in m/z), or **PURGE** (|m/z diff| > 0.5 Da)."
-            )
-            manual_panel.dataframe(
-                _df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "composition": st.column_config.TextColumn("Composition"),
-                    "status": st.column_config.TextColumn(
-                        "Match status",
-                        help=(
-                            "match: at least one of the 2 closest "
-                            "theoretical compositions is within 0.5 "
-                            "Da of the measured m/z. no close match: "
-                            "the closest composition in the residue "
-                            "grid is shown, with its Da offset, so "
-                            "you can see what the input was closest to."
-                        ),
-                    ),
-                    "mz": st.column_config.NumberColumn("Measured m/z", format="%.4f"),
-                    "theoretical_mz": st.column_config.NumberColumn(
-                        "Theoretical m/z", format="%.4f"
-                    ),
-                    "mz_diff": st.column_config.NumberColumn(
-                        "Off by (Da)", format="%+.4f"
-                    ),
-                    "tier": st.column_config.TextColumn("Tier"),
-                    "screen_notes": st.column_config.TextColumn("Screen notes"),
-                    "score_companion": st.column_config.NumberColumn(
-                        "Companion score", format="%d"
-                    ),
-                    "score_series": st.column_config.NumberColumn(
-                        "Series score", format="%d"
-                    ),
-                },
-            )
-
+                "theoretical_mz": st.column_config.NumberColumn(
+                    "Closest theoretical m/z", format="%.4f"
+                ),
+                "mz_diff": st.column_config.NumberColumn(
+                    "Off by (Da)", format="%+.4f"
+                ),
+            },
+        )
     st.divider()
 
     # ---- Sidebar --------------------------------------------------------
@@ -3346,6 +3358,28 @@ def main() -> None:
             )
             df = _candidates_to_dataframe(
                 cands,
+                sp.peaks,
+                da_tol=da_tol_for_solver,
+                strictness="strict" if run_screener else "off",
+                galnac_biased=galnac_biased,
+            )
+            manual_records = list(
+                st.session_state.get(f"manual_peak_entries::{lbl}", [])
+            )
+            manual_peaks = [
+                Peak(
+                    mz=float(record["mz"]),
+                    intensity=float(record["intensity"]),
+                )
+                for record in manual_records
+                if isinstance(record, dict)
+                and "mz" in record
+                and "intensity" in record
+            ]
+            df = _merge_manual_peak_candidates(
+                df,
+                manual_peaks,
+                adducts,
                 sp.peaks,
                 da_tol=da_tol_for_solver,
                 strictness="strict" if run_screener else "off",
